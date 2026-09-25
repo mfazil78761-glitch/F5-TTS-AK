@@ -18,8 +18,6 @@ REPO_OWNER = "mfazil78761-glitch"
 REPO_NAME = "F5-TTS-AK"
 DB_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/users_db.json"
 
-# Store the GitHub PAT in Streamlit secrets instead of hard-coding it.
-# strip() removes accidental spaces/newlines copied into Streamlit Secrets.
 GITHUB_PAT_TOKEN = str(st.secrets.get("GITHUB_PAT_TOKEN", "")).strip()
 
 
@@ -31,7 +29,6 @@ def fetch_live_database():
     except Exception:
         pass
 
-    # Fallback structure matching the expected JSON data mapping.
     return {
         "AKKHAN": {
             "password": "AKKHAN90",
@@ -65,7 +62,6 @@ def push_database_updates_to_github(updated_db_dict):
     }
 
     try:
-        # Check authentication first so HTTP 401 has a clear explanation.
         auth_res = requests.get(
             "https://api.github.com/user",
             headers=headers,
@@ -322,3 +318,114 @@ if account_profile.get("is_admin", False):
                 if st.button(
                     "💾 Save Changes",
                     key=f"save_edit_{u_name}",
+                    use_container_width=True,
+                ):
+                    user_db[u_name]["remaining_chars"] = new_limit_chars
+
+                    if extend_extra_days > 0:
+                        curr_exp = datetime.strptime(
+                            u_info["expiry_timestamp"],
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+
+                        if curr_exp < datetime.now():
+                            curr_exp = datetime.now()
+
+                        user_db[u_name]["expiry_timestamp"] = (
+                            curr_exp
+                            + timedelta(days=int(extend_extra_days))
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+
+                    if push_database_updates_to_github(user_db):
+                        st.success(f"Saved changes for {u_name}!")
+                        st.rerun()
+
+            st.write("---")
+
+        if not active_users_exist:
+            st.info(
+                "Filhal database registry mein koi regular user add nahi hai. "
+                "Naya user add karne ke liye barabar waale tab par jayein."
+            )
+
+    with tab_admin_add:
+        st.subheader("Register New Client Instance")
+
+        with st.form("new_user_registration_form"):
+            reg_user = st.text_input(
+                "New Client Username"
+            ).upper().strip()
+
+            reg_pass = st.text_input(
+                "Set Login Secret Password"
+            )
+
+            reg_days = st.number_input(
+                "Assign Duration (In Days)",
+                min_value=1,
+                value=30,
+            )
+
+            reg_chars = st.number_input(
+                "Assign Character Allocation",
+                min_value=1000,
+                value=1000000,
+            )
+
+            create_user_btn = st.form_submit_button(
+                "🚀 Deploy User to GitHub DB"
+            )
+
+            if create_user_btn:
+                if not reg_user or not reg_pass:
+                    st.error("Fields cannot be blank parameters.")
+
+                elif reg_user in user_db:
+                    st.error("🚨 Username handle already exists!")
+
+                else:
+                    calculated_expiry_timestamp = (
+                        datetime.now()
+                        + timedelta(days=int(reg_days))
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+
+                    user_db[reg_user] = {
+                        "password": reg_pass,
+                        "expiry_timestamp": calculated_expiry_timestamp,
+                        "total_limit": int(reg_chars),
+                        "remaining_chars": int(reg_chars),
+                        "is_revoked": False,
+                        "is_admin": False,
+                    }
+
+                    if push_database_updates_to_github(user_db):
+                        st.success(
+                            f"🎉 User '{reg_user}' successfully deployed "
+                            "and auto-committed!"
+                        )
+                        st.rerun()
+
+    st.stop()
+
+
+# --- REGULAR CLIENT INTERFACE PANEL ---
+st.title("🎛 Premium F5-TTS Interface Workflow Dashboard")
+
+expiry_target_obj = datetime.strptime(
+    account_profile["expiry_timestamp"],
+    "%Y-%m-%d %H:%M:%S"
+)
+
+time_delta_now = expiry_target_obj - datetime.now()
+
+if time_delta_now.total_seconds() > 0:
+    days = time_delta_now.days
+    hours, remainder = divmod(time_delta_now.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    st.info(
+        f"⏳ Plan remaining: {days} days, "
+        f"{hours} hours, {minutes} minutes, {seconds} seconds"
+    )
+else:
+    st.error("🚨 Your plan has expired.")
