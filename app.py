@@ -6,6 +6,7 @@ import urllib.parse
 from datetime import datetime, timedelta
 import requests
 import base64
+import random
 
 # --- STREAMLIT PAGE CONFIGURATION ---
 st.set_page_config(
@@ -23,10 +24,16 @@ GITHUB_PAT_TOKEN = str(st.secrets.get("GITHUB_PAT_TOKEN", "")).strip()
 
 def fetch_live_database():
     try:
-        # Cache bypass lagaya hai takay live data turant refresh ho kar aye
-        res = requests.get(f"{DB_URL}?nocache={int(datetime.now().timestamp())}", timeout=15)
+        # Cache bypass lagaya hai dynamic timestamps and random query se takay live updates fauran fetch hon
+        cache_bypass_url = f"{DB_URL}?v={int(datetime.now().timestamp())}&rand={random.randint(1000, 9999)}"
+        res = requests.get(cache_bypass_url, timeout=15)
         if res.status_code == 200:
-            return res.json().get("users", {})
+            raw_users = res.json().get("users", {})
+            # Case-Insensitive login ke liye poori dictionary ke keys ko standard UPPERCASE mein convert karna
+            normalized_db = {}
+            for k, v in raw_users.items():
+                normalized_db[str(k).upper().strip()] = v
+            return normalized_db
     except Exception:
         pass
     return {"AKKHAN": {"password": "AKKHAN90", "expiry_timestamp": "2030-12-31 23:59:59", "total_limit": 99999999, "remaining_chars": 99999999, "is_revoked": False, "is_admin": True}}
@@ -46,7 +53,13 @@ def push_database_updates_to_github(updated_db_dict):
         get_res = requests.get(api_url, headers=headers, timeout=15)
         if get_res.status_code != 200: return False
         sha = get_res.json().get("sha")
-        encoded_content = base64.b64encode(json.dumps({"users": updated_db_dict}, indent=2).encode("utf-8")).decode("ascii")
+        
+        # Dictionary structure normalization before final push commit
+        final_payload_dict = {}
+        for k, v in updated_db_dict.items():
+            final_payload_dict[str(k).upper().strip()] = v
+
+        encoded_content = base64.b64encode(json.dumps({"users": final_payload_dict}, indent=2).encode("utf-8")).decode("ascii")
         payload = {"message": "Automated update from Web UI Panel Admin Action", "content": encoded_content, "sha": sha}
         put_res = requests.put(api_url, headers=headers, json=payload, timeout=15)
         return put_res.status_code in (200, 201)
@@ -63,10 +76,10 @@ if "current_user" not in st.session_state:
 if "current_password" not in st.session_state:
     st.session_state.current_password = ""
 
-# Persistent State Parameter Check
+# Persistent State Parameter Check ( surivive drop after click reload )
 query_params = st.query_params
 if not st.session_state.auth_session and "user" in query_params and "auth" in query_params:
-    u_state = query_params["user"]
+    u_state = str(query_params["user"]).upper().strip()
     p_state = query_params["auth"]
     if u_state in user_db and user_db[u_state]["password"] == p_state:
         st.session_state.auth_session = True
@@ -164,7 +177,7 @@ if account_profile.get("is_admin", False):
             st.write("---")
             
         if not active_users_exist:
-            st.info("Filhal database registry mein koi regular user add nahi hai.")
+            st.info("Filhal database registry mein koi regular user add nahi hai. Naya SaaS Client tab se add karein.")
 
     elif app_page_mode == "➕ Deploy New SaaS Client":
         st.title("👑 Register New Client Instance")
@@ -174,10 +187,11 @@ if account_profile.get("is_admin", False):
             reg_days = st.number_input("Assign Duration (In Days)", min_value=1, value=30)
             reg_chars = st.number_input("Assign Character Allocation", min_value=1000, value=1000000)
             create_user_btn = st.form_submit_button("🚀 Deploy User to GitHub DB")
-            if create_user_btn and reg_user and reg_pass and reg_user not in user_db:
-                calculated_expiry_timestamp = (datetime.now() + timedelta(days=int(reg_days))).strftime("%Y-%m-%d %H:%M:%S")
-                user_db[reg_user] = {"password": reg_pass, "expiry_timestamp": calculated_expiry_timestamp, "total_limit": int(reg_chars), "remaining_chars": int(reg_chars), "is_revoked": False, "is_admin": False}
-                if push_database_updates_to_github(user_db): st.rerun()
+            if create_user_btn and reg_user and reg_pass:
+                user_db[reg_user] = {"password": reg_pass, "expiry_timestamp": (datetime.now() + timedelta(days=int(reg_days))).strftime("%Y-%m-%d %H:%M:%S"), "total_limit": int(reg_chars), "remaining_chars": int(reg_chars), "is_revoked": False, "is_admin": False}
+                if push_database_updates_to_github(user_db):
+                    st.success(f"🎉 User '{reg_user}' successfully deployed and auto-committed to GitHub!")
+                    st.rerun()
     st.stop()
 
 # --- REGULAR CLIENT SaaS SCREEN INTERFACE ---
@@ -190,15 +204,3 @@ if time_delta_now.total_seconds() > 0:
     days = time_delta_now.days
     hours, remainder = divmod(time_delta_now.seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
-    countdown_clock_string = f"⏱️ Time Remaining: **{days} days {hours} hours {minutes} minutes {seconds} seconds**"
-else:
-    countdown_clock_string = "🚨 Package Plan Validity Status: **Expired!**"
-
-st.markdown(f"""
-<div style="background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%); padding: 25px; border-radius: 12px; color: white; margin-bottom: 25px; border-left: 6px solid #4facfe;">
-    <h3 style='margin:0; color: white;'>✨ Session Active: {active_username.upper()} Console</h3>
-    <p style='margin:8px 0; font-size:17px; color: #6dd5ed;'>{countdown_clock_string}</p>
-    <p style='margin:0; font-size:14px; opacity:0.85;'>Character Available Balance: <b>{account_profile['remaining_chars']:,} / {account_profile['total_limit']:,} Chars</b></p>
-</div>
-""", unsafe_allow_html=True)
-
