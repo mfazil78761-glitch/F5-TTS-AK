@@ -440,74 +440,93 @@ except Exception as exc:
         worker_generation_started = False
         last_worker_progress = 0
 
-        # No application-level time limit: keep waiting until Kaggle actually
-        # finishes the submitted T4 generation job and generated.wav is available.
-        while True:
-            # Do NOT use `kaggle kernels status` here. In this deployment it
-            # can hit the GetKernelSessionStatus endpoint and return HTTP 404.
-            # The generated output/logs are the reliable signals we need.
-            log_result = subprocess.run(
-                ["kaggle", "kernels", "logs", kernel_ref],
-                env=env, capture_output=True, text=True, check=False
-            )
-            log_text = ((log_result.stdout or "") + "\n" + (log_result.stderr or "")).strip()
-            last_status = log_text[-2500:]
-            log_upper = log_text.upper()
+        # IMPORTANT: there is deliberately NO application-level generation
+        # timeout here. We stream Kaggle's live kernel log until Kaggle closes
+        # the log stream, then download the output. This prevents a long 25-30
+        # minute narration from being mistaken for a failed generation.
+        # `kernels status` is intentionally not used because this deployment
+        # previously returned GetKernelSessionStatus HTTP 404.
+        import select
+        log_process = subprocess.Popen(
+            ["kaggle", "kernels", "logs", kernel_ref, "--follow"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
 
-            if any(marker in log_upper for marker in (
-                "KERNEL FAILED", "KERNEL ERROR", "TRACEBACK", "RUNTIMEERROR",
-                "EXCEPTION", "CANCELLED", "CANCELED", "FAILED TO RUN"
-            )):
-                final_state = "error"
-                break
+        try:
+            while True:
+                # A short select interval is ONLY a UI heartbeat; it is not a
+                # timeout on Kaggle or on the generation process.
+                ready, _, _ = select.select([log_process.stdout], [], [], 2.0)
+                if ready:
+                    line = log_process.stdout.readline()
+                    if line:
+                        last_status = (last_status + "\n" + line.strip())[-5000:]
+                        log_upper = line.upper()
 
-            percent_matches = re.findall(r"(?:\[|\s|^)(\d{1,3})(?:\.\d+)?%", log_text)
-            parsed_percent = None
-            for raw_percent in reversed(percent_matches):
-                value = int(raw_percent)
-                if 0 <= value <= 100:
-                    parsed_percent = value
+                        if any(marker in log_upper for marker in (
+                            "KERNEL FAILED", "KERNEL ERROR", "TRACEBACK", "RUNTIMEERROR",
+                            "EXCEPTION", "CANCELLED", "CANCELED", "FAILED TO RUN"
+                        )):
+                            final_state = "error"
+                            break
+
+                        percent_matches = re.findall(r"(?:\[|\s|^)(\d{1,3})(?:\.\d+)?%", line)
+                        parsed_percent = None
+                        for raw_percent in reversed(percent_matches):
+                            value = int(raw_percent)
+                            if 0 <= value <= 100:
+                                parsed_percent = value
+                                break
+
+                        if any(marker in log_upper for marker in (
+                            "F5-TTS MODEL IS RUNNING", "STARTING F5-TTS",
+                            "F5-TTS GENERATION STARTED", "INFER", "GENERATING"
+                        )):
+                            worker_generation_started = True
+
+                        if parsed_percent is not None and worker_generation_started:
+                            last_worker_progress = parsed_percent
+                            report(parsed_percent, f"🎙️ Voice generation: {parsed_percent}% complete")
+                        elif worker_generation_started:
+                            report(max(1, last_worker_progress), "🎙️ Voice generation is running on the Kaggle T4...")
+                        else:
+                            report(15, "⏳ Kaggle T4 is starting the F5-TTS worker...")
+                    elif log_process.poll() is not None:
+                        final_state = "complete" if log_process.returncode == 0 else "error"
+                        break
+                elif log_process.poll() is not None:
+                    final_state = "complete" if log_process.returncode == 0 else "error"
                     break
 
-            if any(marker in log_upper for marker in ("F5-TTS MODEL IS RUNNING", "STARTING F5-TTS", "F5-TTS GENERATION STARTED", "INFER")):
-                worker_generation_started = True
+                # If the log stream is alive but silent, keep the UI truthful
+                # instead of inventing progress.
+                if worker_generation_started:
+                    report(max(1, last_worker_progress), "🎙️ F5-TTS is still generating on the Kaggle T4...")
+                else:
+                    report(15, "⏳ Kaggle T4 is starting the F5-TTS worker...")
+        finally:
+            if log_process.stdout:
+                log_process.stdout.close()
+            if log_process.poll() is None:
+                log_process.terminate()
+                log_process.wait()
 
-            if parsed_percent is not None and worker_generation_started:
-                # During the actual F5-TTS inference, show the percentage
-                # reported by the worker/logs directly.
-                last_worker_progress = parsed_percent
-                report(parsed_percent, f"🎙️ Voice generation: {parsed_percent}% complete")
-            elif worker_generation_started:
-                # If the current F5-TTS build does not expose a numeric
-                # inference percentage, keep the bar at the real generation
-                # phase rather than inventing a fake percentage.
-                report(max(0, last_worker_progress), "🎙️ Voice generation is running on the Kaggle T4...")
-            else:
-                report(15, "⏳ Kaggle T4 is starting the F5-TTS worker...")
+        if final_state == "error":
+            report(max(1, last_worker_progress), "❌ Kaggle reported an error while running the T4 worker.")
+            return None, "Kaggle T4 job reported an error or was cancelled.\n\n" + last_status
 
-            # Probe Kaggle output without relying on the broken session-status
-            # endpoint. Once generated.wav appears, generation is complete.
-            output_probe = subprocess.run(
-                ["kaggle", "kernels", "output", kernel_ref, "-p", str(output_dir), "-o", "-q"],
-                env=env, capture_output=True, text=True, check=False
-            )
-            if output_probe.returncode == 0 and list(output_dir.rglob("generated.wav")):
-                final_state = "complete"
-                break
-
-            final_state = "running"
-            time.sleep(3)
-
-        if final_state != "complete":
-            report(100, "❌ Kaggle T4 job failed or was cancelled.")
-            return None, "Kaggle T4 job failed or was cancelled.\n\n" + last_status
-
-        report(85, "Kaggle finished the T4 job. Downloading the generated WAV...")
+        # The log stream ended normally. Now retrieve the completed output.
+        report(max(85, last_worker_progress), "📦 Kaggle T4 finished. Retrieving the generated WAV...")
         download = subprocess.run(["kaggle", "kernels", "output", kernel_ref, "-p", str(output_dir), "-o", "-q"], env=env, capture_output=True, text=True, check=False)
         if download.returncode != 0:
             details = ((download.stdout or "") + "\n" + (download.stderr or "")).strip()
-            return None, "Kaggle completed the notebook, but its output could not be downloaded.\n" + details[:5000]
+            return None, "Kaggle finished the worker, but its output could not be downloaded.\n" + details[:5000]
 
+        final_state = "complete"
         status_files = list(output_dir.rglob("f5tts_status.json"))
         if status_files:
             try:
@@ -841,7 +860,7 @@ elif page == "🔊 Text To Speech":
                             state="error",
                             expanded=True,
                         )
-                        progress_bar.progress(100)
+                        progress_bar.progress(0)
                         status_box.error(
                             "The request did not complete. See the diagnostic below."
                         )
