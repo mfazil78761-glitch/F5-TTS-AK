@@ -380,11 +380,13 @@ try:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', '--upgrade', 'pip'])
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'f5-tts'])
     write_status('generating', 'F5-TTS model is running on the Kaggle GPU')
+    print('F5-TTS GENERATION STARTED 0%', flush=True)
     from f5_tts.api import F5TTS
     tts = F5TTS(model='F5TTS_v1_Base', device='cuda')
     tts.infer(ref_file=str(VOICE), ref_text='', gen_text=TEXT, file_wave=str(AUDIO), remove_silence=False)
     if not AUDIO.exists() or AUDIO.stat().st_size < 1000:
         raise RuntimeError('F5-TTS finished without producing a valid WAV file.')
+    print('F5-TTS GENERATION COMPLETE 100%', flush=True)
     write_status('success', 'Audio generated successfully')
     print('F5-TTS audio generated:', AUDIO.stat().st_size, 'bytes', flush=True)
 except Exception as exc:
@@ -436,35 +438,66 @@ except Exception as exc:
         report(60, "Kaggle accepted the notebook. Waiting for the T4 job...")
         final_state = ""
         last_status = ""
-        deadline = time.monotonic() + 360
-        while time.monotonic() < deadline:
+        worker_generation_started = False
+        last_worker_progress = 0
+
+        # No foreground time limit: keep this request alive until Kaggle
+        # actually finishes the submitted T4 generation job.
+        while True:
             status_result = subprocess.run(["kaggle", "kernels", "status", kernel_ref], env=env, capture_output=True, text=True, timeout=15, check=False)
             status_text = ((status_result.stdout or "") + "\n" + (status_result.stderr or "")).strip()
             last_status = status_text[-1500:]
             upper = status_text.upper()
-            if "ERROR" in upper or "FAILED" in upper:
+
+            if "ERROR" in upper or "FAILED" in upper or "CANCEL" in upper:
                 final_state = "error"
                 break
             if "COMPLETE" in upper or "SUCCEEDED" in upper:
                 final_state = "complete"
                 break
+
+            # Once Kaggle starts executing the notebook, inspect its live
+            # kernel logs. If F5-TTS exposes an inference percentage, show
+            # that percentage. Otherwise show a safe phase-based estimate
+            # without changing the actual TTS generation.
+            log_result = subprocess.run(
+                ["kaggle", "kernels", "logs", kernel_ref],
+                env=env, capture_output=True, text=True, timeout=10, check=False
+            )
+            log_text = ((log_result.stdout or "") + "\n" + (log_result.stderr or "")).strip()
+            log_upper = log_text.upper()
+
+            import re
+            percent_matches = re.findall(r"(?:\[|\s|^)(\d{1,3})(?:\.\d+)?%", log_text)
+            parsed_percent = None
+            for raw_percent in reversed(percent_matches):
+                value = int(raw_percent)
+                if 0 <= value <= 100:
+                    parsed_percent = value
+                    break
+
+            if any(marker in log_upper for marker in ("F5-TTS MODEL IS RUNNING", "STARTING F5-TTS", "F5-TTS GENERATION STARTED", "INFER")):
+                worker_generation_started = True
+
+            if parsed_percent is not None and worker_generation_started:
+                # During the actual F5-TTS inference, show the percentage
+                # reported by the worker/logs directly.
+                last_worker_progress = parsed_percent
+                report(parsed_percent, f"🎙️ Voice generation: {parsed_percent}% complete")
+            elif worker_generation_started:
+                # If the current F5-TTS build does not expose a numeric
+                # inference percentage, keep the bar at the real generation
+                # phase rather than inventing a fake percentage.
+                report(max(0, last_worker_progress), "🎙️ Voice generation is running on the Kaggle T4...")
+            else:
+                report(15, "⏳ Kaggle T4 is starting the F5-TTS worker...")
+
             final_state = "running"
-            elapsed = int(360 - max(0, deadline - time.monotonic()))
-            report(min(82, 60 + int((elapsed / 360) * 22)), f"Kaggle T4 job status: running ({elapsed}s/360s)")
             time.sleep(3)
 
         if final_state != "complete":
-            # The six-minute request window is only the initial foreground wait.
-            # Kaggle keeps the submitted job running; Streamlit polls it
-            # in the background so a slow GPU startup does not become a
-            # false generation failure.
-            report(100, "Kaggle T4 job is still running. Background polling will continue.")
-            return {
-                "pending": True,
-                "kernel_ref": kernel_ref,
-                "output_dir": str(output_dir),
-                "last_status": last_status,
-            }, None
+            report(100, "❌ Kaggle T4 job failed or was cancelled.")
+            return None, "Kaggle T4 job failed or was cancelled.\n\n" + last_status
 
         report(85, "Kaggle finished the T4 job. Downloading the generated WAV...")
         download = subprocess.run(["kaggle", "kernels", "output", kernel_ref, "-p", str(output_dir), "-o", "-q"], env=env, capture_output=True, text=True, timeout=60, check=False)
@@ -768,33 +801,6 @@ elif page == "🎤 Voice Cloning":
 elif page == "🔊 Text To Speech":
     st.title("🔊 Text To Speech")
 
-    # Continue a Kaggle job if the six-minute request window expires while Kaggle is still running.
-    pending_job = st.session_state.get("pending_kaggle_job")
-    if pending_job:
-        @st.fragment(run_every="5s")
-        def kaggle_background_status():
-            state, audio_bytes, detail = poll_pending_kaggle_job(pending_job)
-            if state == "running":
-                st.info("⏳ Kaggle T4 is still running. This page will update automatically.")
-                if detail:
-                    st.caption(detail[-500:])
-            elif state == "complete":
-                char_amount = int(st.session_state.get("pending_kaggle_chars", 0))
-                if char_amount and deduct_characters(char_amount):
-                    st.session_state.completed_audio_message = f"✅ Audio generated successfully. {char_amount:,} characters deducted."
-                else:
-                    st.session_state.completed_audio_message = "⚠️ Audio generated, but the character balance could not be updated."
-                st.session_state.completed_audio = audio_bytes
-                st.session_state.completed_audio_chars = char_amount
-                st.session_state.pending_kaggle_job = None
-                st.success(st.session_state.completed_audio_message)
-                st.rerun()
-            else:
-                st.session_state.pending_kaggle_job = None
-                st.error(detail)
-                st.rerun()
-        kaggle_background_status()
-
     if st.session_state.get("completed_audio"):
         st.success(st.session_state.get("completed_audio_message", "Audio generated successfully."))
         st.audio(st.session_state.completed_audio, format="audio/wav")
@@ -927,20 +933,7 @@ elif page == "🔊 Text To Speech":
                         # not proof that audio was generated.
                         audio_received = False
 
-                        if isinstance(generated, dict) and generated.get("pending"):
-                            st.session_state.pending_kaggle_job = generated
-                            st.session_state.pending_kaggle_chars = current_count
-                            generation_status.update(
-                                label="⏳ Kaggle T4 job submitted; background polling active",
-                                state="complete",
-                                expanded=True,
-                            )
-                            st.info(
-                                "⏳ Kaggle is still processing the request. The six-minute window was reached; the job may continue in the background. "
-                                "Kaggle will continue the GPU job and this page will check it automatically."
-                            )
-
-                        elif isinstance(generated, bytes):
+                        if isinstance(generated, bytes):
                             audio_received = True
                             st.audio(
                                 generated,
