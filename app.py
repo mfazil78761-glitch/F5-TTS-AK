@@ -16,7 +16,7 @@ st.set_page_config(
 # --- CENTRAL GITHUB DATABASE CONFIG ---
 REPO_OWNER = "mfazil78761-glitch"
 REPO_NAME = "F5-TTS-AK"
-DB_URL = f"https://githubusercontent.com{REPO_OWNER}/{REPO_NAME}/main/users_db.json"
+DB_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/users_db.json"
 
 GITHUB_PAT_TOKEN = str(st.secrets.get("GITHUB_PAT_TOKEN", "")).strip()
 
@@ -36,7 +36,7 @@ def push_database_updates_to_github(updated_db_dict):
         st.error("GitHub PAT missing. Add a valid GITHUB_PAT_TOKEN to Streamlit Secrets.")
         return False
 
-    api_url = f"https://github.com{REPO_OWNER}/{REPO_NAME}/contents/users_db.json"
+    api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/users_db.json"
     headers = {
         "Authorization": f"Bearer {GITHUB_PAT_TOKEN}",
         "Accept": "application/vnd.github+json",
@@ -45,7 +45,7 @@ def push_database_updates_to_github(updated_db_dict):
     }
 
     try:
-        auth_res = requests.get("https://github.com", headers=headers, timeout=15)
+        auth_res = requests.get("https://api.github.com/user", headers=headers, timeout=15)
         if auth_res.status_code == 401:
             st.error("GitHub PAT authentication failed (HTTP 401).")
             return False
@@ -133,28 +133,32 @@ if account_profile.get("is_admin", False):
         st.subheader("Manage Global Users Parameters")
         active_users_exist = False
         for u_name, u_info in list(user_db.items()):
-            if u_info.get("is_admin", False): continue
+            if u_info.get("is_admin", False):
+                continue
             active_users_exist = True
             status_badge = "🟢 Active Status" if not u_info.get("is_revoked", False) else "🔴 Access Revoked"
             st.markdown(f"#### Profile Handle: `{u_name}` | Status: **{status_badge}**")
-            
+
             new_limit_chars = st.number_input("Characters Balance Remaining:", value=int(u_info["remaining_chars"]), key=f"char_{u_name}")
             extend_extra_days = st.number_input("Extend Plan Days (Add):", min_value=0, value=0, key=f"days_{u_name}")
-            
+
             revoked_state_toggle = u_info.get("is_revoked", False)
             btn_txt = "🟢 Grant Access" if revoked_state_toggle else "🔴 Revoke Access"
-            
+
             if st.button(btn_txt, key=f"rev_btn_{u_name}"):
                 user_db[u_name]["is_revoked"] = not revoked_state_toggle
-                if push_database_updates_to_github(user_db): st.rerun()
-                
+                if push_database_updates_to_github(user_db):
+                    st.rerun()
+
             if st.button("💾 Save Changes", key=f"save_edit_{u_name}"):
                 user_db[u_name]["remaining_chars"] = new_limit_chars
                 if extend_extra_days > 0:
                     curr_exp = datetime.strptime(u_info["expiry_timestamp"], "%Y-%m-%d %H:%M:%S")
-                    if curr_exp < datetime.now(): curr_exp = datetime.now()
+                    if curr_exp < datetime.now():
+                        curr_exp = datetime.now()
                     user_db[u_name]["expiry_timestamp"] = (curr_exp + timedelta(days=int(extend_extra_days))).strftime("%Y-%m-%d %H:%M:%S")
-                if push_database_updates_to_github(user_db): st.rerun()
+                if push_database_updates_to_github(user_db):
+                    st.rerun()
             st.write("---")
 
     with tab_admin_add:
@@ -169,12 +173,28 @@ if account_profile.get("is_admin", False):
                 if reg_user and reg_pass and reg_user not in user_db:
                     calculated_expiry_timestamp = (datetime.now() + timedelta(days=int(reg_days))).strftime("%Y-%m-%d %H:%M:%S")
                     user_db[reg_user] = {"password": reg_pass, "expiry_timestamp": calculated_expiry_timestamp, "total_limit": int(reg_chars), "remaining_chars": int(reg_chars), "is_revoked": False, "is_admin": False}
-                    if push_database_updates_to_github(user_db): st.rerun()
+                    if push_database_updates_to_github(user_db):
+                        st.rerun()
     st.stop()
 
 
 # --- REGULAR CLIENT INTERFACE PANEL (MOBILE FRIENDLY FIXED) ---
 st.title("🎛️ Premium F5-TTS Interface Workflow Dashboard")
+
+# Responsive layout trigger: Mobile ke liye columns ko full wide vertical render karna
+st.markdown("""
+<style>
+@media (max-width: 640px) {
+    div[data-testid="stHorizontalBlock"] {
+        flex-direction: column !important;
+    }
+    div[data-testid="column"] {
+        width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
 
 expiry_target_obj = datetime.strptime(account_profile["expiry_timestamp"], "%Y-%m-%d %H:%M:%S")
 time_delta_now = expiry_target_obj - datetime.now()
@@ -215,5 +235,41 @@ if len(existing_voices) < 5:
                 st.success("Speaker saved successfully!")
                 st.rerun()
 
+selected_voice_path = None
+
 if existing_voices:
     for voice_file in existing_voices:
+        voice_row_left, voice_row_right = st.columns([4, 1], gap="small")
+        with voice_row_left:
+            st.audio(os.path.join(user_voice_dir, voice_file))
+            st.caption(voice_file.replace(".wav", ""))
+        with voice_row_right:
+            if st.button("🗑️ Delete", key=f"del_{voice_file}", use_container_width=True):
+                os.remove(os.path.join(user_voice_dir, voice_file))
+                st.rerun()
+    st.write("---")
+
+    # --- TTS GENERATION PANEL ---
+    st.subheader("🎙️ Generate Speech")
+    voice_choices = [v.replace(".wav", "") for v in existing_voices]
+
+    col_left, col_right = st.columns([1, 1.2], gap="large")
+
+    with col_left:
+        selected_voice_name = st.selectbox("Choose Reference Speaker", voice_choices)
+        selected_voice_path = os.path.join(user_voice_dir, f"{selected_voice_name}.wav")
+        speed_setting = st.slider("Speech Speed", min_value=0.5, max_value=2.0, value=1.0, step=0.1)
+        generate_btn = st.button("🚀 Generate Audio", use_container_width=True, type="primary")
+
+    with col_right:
+        text_to_speak = st.text_area("Enter text to synthesize", height=220, placeholder="Type or paste your script here...")
+
+    if generate_btn:
+        if not text_to_speak.strip():
+            st.warning("Pehle kuch text likhein generate karne ke liye.")
+        elif len(text_to_speak) > account_profile["remaining_chars"]:
+            st.error("🚨 Not enough character balance remaining for this text.")
+        else:
+            st.info("TTS generation pipeline yahan call hogi (F5-TTS engine integration).")
+else:
+    st.info("Speech generate karne se pehle upar se ek reference speaker add karein.")
