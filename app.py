@@ -5,6 +5,7 @@ import subprocess
 import urllib.parse
 from datetime import datetime, timedelta
 import requests
+import base64
 
 st.set_page_config(
     page_title="F5-TTS Cloud Multi-Tenant SaaS",
@@ -113,7 +114,7 @@ def push_database_updates_to_github(updated_db_dict):
 
         sha = get_res.json().get("sha")
 
-        encoded_content = requests.utils.base64.b64encode(
+        encoded_content = base64.b64encode(
             json.dumps(
                 {"users": updated_db_dict},
                 indent=2,
