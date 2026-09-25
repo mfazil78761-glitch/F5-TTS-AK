@@ -324,17 +324,9 @@ def save_kaggle_settings(
 
 def generate_with_kaggle(text, voice_path, progress_callback=None):
     """
-    Creates a private Kaggle GPU notebook workspace for the active user.
-
-    This runs on the Streamlit server/container. It cannot execute a
-    command directly on the user's phone or PC terminal.
-
-    The generated Kaggle notebook:
-      - frees port 7860
-      - installs pyngrok and f5-tts
-      - starts master_wrapper_launcher.py in the background
-      - launches the official F5-TTS Gradio inference app
-      - binds the user's Ngrok static domain
+    Start a private Kaggle T4 worker, wait for its authenticated API to come
+    online, upload the selected reference voice + text, and return the
+    generated WAV bytes to Streamlit.
     """
     def report(percent, message):
         if progress_callback is not None:
@@ -345,32 +337,18 @@ def generate_with_kaggle(text, voice_path, progress_callback=None):
 
     try:
         report(5, "Checking Kaggle and Ngrok connection fields...")
-        # 1. Extract the four profile credentials/settings.
-        k_user = str(
-            account_profile.get("kaggle_username", "")
-        ).strip()
 
-        k_token = str(
-            account_profile.get("kaggle_token", "")
-        ).strip()
-
-        n_auth = str(
-            account_profile.get("ngrok_auth_token", "")
-        ).strip()
-
-        n_domain = str(
-            account_profile.get("ngrok_static_domain", "")
-        ).strip()
+        k_user = str(account_profile.get("kaggle_username", "")).strip()
+        k_token = str(account_profile.get("kaggle_token", "")).strip()
+        n_auth = str(account_profile.get("ngrok_auth_token", "")).strip()
+        n_domain = str(account_profile.get("ngrok_static_domain", "")).strip()
 
         if not k_user:
             return None, "Kaggle Username is missing in Settings."
-
         if not k_token:
             return None, "Kaggle API Token is missing in Settings."
-
         if not n_auth:
             return None, "Ngrok Auth Token is missing in Settings."
-
         if not n_domain:
             return None, "Ngrok Static Domain is missing in Settings."
 
@@ -380,174 +358,209 @@ def generate_with_kaggle(text, voice_path, progress_callback=None):
             .strip("/")
         )
 
-        # Create an isolated temporary push workspace.
+        if any(ch.isspace() for ch in n_domain):
+            return None, "Ngrok Static Domain contains whitespace."
+
+        worker_key = uuid.uuid4().hex + uuid.uuid4().hex
+
         raw_slug = (
             f"f5tts-{active_username.lower()}-"
             f"{uuid.uuid4().hex[:10]}"
         )
-
         kernel_slug = "".join(
             c if c.isalnum() or c == "-" else "-"
             for c in raw_slug
         ).strip("-")[:80]
 
-        report(15, "Credentials look valid. Preparing the private Kaggle GPU worker...")
+        report(15, "Credentials look valid. Preparing the private Kaggle T4 worker...")
 
-        workspace = Path(
-            tempfile.mkdtemp(
-                prefix="f5tts_kaggle_"
-            )
-        )
-
+        workspace = Path(tempfile.mkdtemp(prefix="f5tts_kaggle_"))
         notebook_path = workspace / "active_worker.ipynb"
-        launcher_path = workspace / "master_wrapper_launcher.py"
+        server_path = workspace / "f5tts_worker_server.py"
         metadata_path = workspace / "kernel-metadata.json"
 
-        # 2. Build the master wrapper launcher.
-        launcher_code = r"""import os
-import subprocess
-import sys
+        server_code = '''import os
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import uvicorn
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 PORT = 7860
+WORKER_KEY = os.environ.get("F5_WORKER_KEY", "").strip()
+NGROK_AUTH = os.environ.get("F5_NGROK_AUTH_TOKEN", "").strip()
+NGROK_DOMAIN = os.environ.get("F5_NGROK_STATIC_DOMAIN", "").strip()
+
+if not WORKER_KEY:
+    raise RuntimeError("F5_WORKER_KEY is missing.")
+if not NGROK_AUTH:
+    raise RuntimeError("F5_NGROK_AUTH_TOKEN is missing.")
+if not NGROK_DOMAIN:
+    raise RuntimeError("F5_NGROK_STATIC_DOMAIN is missing.")
+
+app = FastAPI(title="F5-TTS Private GPU Worker")
+model_holder = {"model": None}
+model_lock = threading.Lock()
+inference_lock = threading.Lock()
 
 
-def kill_port():
-    subprocess.run(
-        ["bash", "-lc", "fuser -k 7860/tcp || true"],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+def get_model():
+    if model_holder["model"] is None:
+        with model_lock:
+            if model_holder["model"] is None:
+                print("Loading F5-TTS model on Kaggle GPU...", flush=True)
+                from f5_tts.api import F5TTS
+                model_holder["model"] = F5TTS(
+                    model="F5TTS_v1_Base",
+                    device="cuda",
+                )
+                print("F5-TTS model loaded.", flush=True)
+    return model_holder["model"]
 
 
-def main():
-    kill_port()
+@app.get("/health")
+def health():
+    return {
+        "status": "online",
+        "model_loaded": model_holder["model"] is not None,
+    }
 
-    ngrok_auth = os.environ.get(
-        "F5_NGROK_AUTH_TOKEN",
-        "",
-    ).strip()
 
-    ngrok_domain = os.environ.get(
-        "F5_NGROK_STATIC_DOMAIN",
-        "",
-    ).strip()
+@app.post("/generate")
+async def generate(
+    text: str = Form(...),
+    voice: UploadFile = File(...),
+    authorization: str = Header(default=""),
+):
+    if authorization != f"Bearer {WORKER_KEY}":
+        raise HTTPException(status_code=401, detail="Unauthorized worker request.")
 
-    if not ngrok_auth:
-        raise RuntimeError(
-            "F5_NGROK_AUTH_TOKEN is missing."
-        )
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Text is empty.")
 
-    if not ngrok_domain:
-        raise RuntimeError(
-            "F5_NGROK_STATIC_DOMAIN is missing."
-        )
+    suffix = Path(voice.filename or "voice.wav").suffix.lower()
+    if suffix not in {".wav", ".mp3", ".m4a", ".ogg", ".flac"}:
+        suffix = ".wav"
 
-    from pyngrok import ngrok
+    with tempfile.TemporaryDirectory(prefix="f5_request_") as tmp:
+        ref_path = Path(tmp) / f"reference{suffix}"
+        out_path = Path(tmp) / "generated.wav"
+        ref_path.write_bytes(await voice.read())
 
-    ngrok.set_auth_token(ngrok_auth)
+        if ref_path.stat().st_size == 0:
+            raise HTTPException(status_code=400, detail="Reference voice file is empty.")
 
-    tunnel = ngrok.connect(
-        addr=PORT,
-        proto="http",
-        domain=ngrok_domain,
-    )
+        print("Received TTS request.", flush=True)
+        print("Reference:", ref_path, flush=True)
+        print("Text length:", len(text), flush=True)
 
-    print(
-        "F5-TTS public workspace:",
-        tunnel.public_url,
-        flush=True,
-    )
-
-    # Official F5-TTS Gradio launcher.
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "f5_tts.infer.infer_gradio",
-            "--port",
-            str(PORT),
-            "--host",
-            "0.0.0.0",
-        ],
-        start_new_session=True,
-    )
-
-    try:
-        process.wait()
-    finally:
         try:
-            ngrok.disconnect(tunnel.public_url)
-        except Exception:
-            pass
+            with inference_lock:
+                tts = get_model()
+                tts.infer(
+                    ref_file=str(ref_path),
+                    ref_text="",
+                    gen_text=text,
+                    file_wave=str(out_path),
+                    remove_silence=False,
+                )
+
+            if not out_path.exists() or out_path.stat().st_size < 1000:
+                raise RuntimeError("F5-TTS completed without producing a valid WAV file.")
+
+            print("Audio generated:", out_path.stat().st_size, "bytes", flush=True)
+            return FileResponse(
+                path=str(out_path),
+                media_type="audio/wav",
+                filename="f5tts_generated.wav",
+            )
+
+        except Exception as exc:
+            print("Generation error:", repr(exc), flush=True)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def start_server():
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
 
 
 if __name__ == "__main__":
-    main()
-"""
+    from pyngrok import ngrok
 
-        launcher_path.write_text(
-            launcher_code,
-            encoding="utf-8",
-        )
+    ngrok.set_auth_token(NGROK_AUTH)
 
-        # 2. Notebook dictionary for active_worker.ipynb.
-        notebook_source = f"""import os
+    server_thread = threading.Thread(target=start_server, daemon=True)
+    server_thread.start()
+
+    for _ in range(60):
+        try:
+            import requests
+            response = requests.get(f"http://127.0.0.1:{PORT}/health", timeout=2)
+            if response.ok:
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        raise RuntimeError("Local F5-TTS API did not start on port 7860.")
+
+    tunnel = ngrok.connect(addr=PORT, proto="http", domain=NGROK_DOMAIN)
+    print("F5-TTS public API:", tunnel.public_url, flush=True)
+    print("F5-TTS worker is ready.", flush=True)
+
+    while True:
+        time.sleep(30)
+'''
+
+        server_path.write_text(server_code, encoding="utf-8")
+
+        notebook_source = f'''import os
 import subprocess
 import sys
-import time
+from pathlib import Path
 
+os.environ["F5_WORKER_KEY"] = {worker_key!r}
 os.environ["F5_NGROK_AUTH_TOKEN"] = {n_auth!r}
 os.environ["F5_NGROK_STATIC_DOMAIN"] = {n_domain!r}
 
-# Kill anything already using the F5-TTS port.
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip"
+])
+
+subprocess.check_call([
+    sys.executable,
+    "-m",
+    "pip",
+    "install",
+    "-q",
+    "f5-tts",
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+    "pyngrok",
+    "requests",
+])
+
 subprocess.run(
     ["bash", "-lc", "fuser -k 7860/tcp || true"],
     check=False,
 )
 
-# Install pyngrok and F5-TTS into the Kaggle GPU runtime.
-subprocess.check_call(
-    [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "-q",
-        "--upgrade",
-        "pip",
-    ]
+server_code = {server_code!r}
+Path("/kaggle/working/f5tts_worker_server.py").write_text(
+    server_code,
+    encoding="utf-8",
 )
 
-subprocess.check_call(
-    [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "-q",
-        "pyngrok",
-        "f5-tts",
-    ]
+print("Starting private F5-TTS T4 API worker...", flush=True)
+subprocess.run(
+    [sys.executable, "/kaggle/working/f5tts_worker_server.py"],
+    check=True,
 )
-
-launcher = "/kaggle/working/master_wrapper_launcher.py"
-
-# Start the wrapper in the background.
-process = subprocess.Popen(
-    [
-        sys.executable,
-        launcher,
-    ],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.STDOUT,
-    start_new_session=True,
-)
-
-print("F5-TTS worker started with PID:", process.pid)
-time.sleep(8)
-print("Secure workspace: https://{n_domain}")
-"""
+'''
 
         notebook = {
             "cells": [
@@ -565,26 +578,19 @@ print("Secure workspace: https://{n_domain}")
                     "language": "python",
                     "name": "python3",
                 },
-                "language_info": {
-                    "name": "python",
-                },
+                "language_info": {"name": "python"},
             },
             "nbformat": 4,
             "nbformat_minor": 5,
         }
 
         notebook_path.write_text(
-            json.dumps(
-                notebook,
-                indent=2,
-                ensure_ascii=False,
-            ),
+            json.dumps(notebook, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
-        report(35, "Building active_worker.ipynb and F5-TTS launcher...")
+        report(35, "Building the authenticated F5-TTS API worker...")
 
-        # 3. Generate kernel-metadata.json.
         metadata = {
             "id": f"{k_user}/{kernel_slug}",
             "title": kernel_slug,
@@ -602,25 +608,19 @@ print("Secure workspace: https://{n_domain}")
         }
 
         metadata_path.write_text(
-            json.dumps(
-                metadata,
-                indent=2,
-            ),
+            json.dumps(metadata, indent=2),
             encoding="utf-8",
         )
 
         report(50, "Worker package is ready. Connecting to your Kaggle account...")
 
-        # 4. Set runtime Kaggle environment blocks.
         env = os.environ.copy()
         env["KAGGLE_USERNAME"] = k_user
         env["KAGGLE_API_TOKEN"] = k_token
-        # Compatibility with legacy Kaggle API authentication.
         env["KAGGLE_KEY"] = k_token
 
-        report(60, "Uploading notebook to Kaggle and requesting the GPU worker...")
+        report(60, "Uploading notebook and requesting the Kaggle T4 GPU...")
 
-        # 5. Push the notebook to Kaggle and let Kaggle run it.
         completed = subprocess.run(
             [
                 "kaggle",
@@ -628,6 +628,8 @@ print("Secure workspace: https://{n_domain}")
                 "push",
                 "-p",
                 str(workspace),
+                "--timeout",
+                "21600",
             ],
             env=env,
             capture_output=True,
@@ -642,18 +644,96 @@ print("Secure workspace: https://{n_domain}")
             + (completed.stderr or "").strip()
         ).strip()
 
-        # 6. Success returns the secure Ngrok workspace URL.
-        if completed.returncode == 0:
-            report(100, "Kaggle accepted the worker request. Secure workspace is being prepared...")
-            return f"https://{n_domain}", None
+        if completed.returncode != 0:
+            report(100, "Kaggle rejected the GPU worker request.")
+            return None, (
+                "Kaggle kernel push failed "
+                f"(exit code {completed.returncode}).\n"
+                f"{combined_output}"
+            )
 
-        # Error returns the CLI trace so the caller can avoid charging.
-        report(100, "Kaggle rejected the worker request.")
-        return None, (
-            "Kaggle kernel push failed "
-            f"(exit code {completed.returncode}).\n"
-            f"{combined_output}"
-        )
+        report(68, "Kaggle accepted the notebook. Waiting for the GPU API to come online...")
+
+        base_url = f"https://{n_domain}"
+        health_url = f"{base_url}/health"
+        generate_url = f"{base_url}/generate"
+
+        last_health_error = ""
+        for attempt in range(1, 121):
+            try:
+                health = requests.get(health_url, timeout=8)
+                if health.ok:
+                    report(75, "Kaggle GPU worker is online. Sending the reference voice and text...")
+                    break
+                last_health_error = f"HTTP {health.status_code}: {health.text[:500]}"
+            except requests.RequestException as exc:
+                last_health_error = str(exc)
+
+            if attempt % 10 == 0:
+                report(
+                    min(88, 68 + attempt // 4),
+                    f"Waiting for Kaggle worker startup... ({attempt}/120)",
+                )
+            time.sleep(3)
+        else:
+            return None, (
+                "Kaggle accepted the notebook, but the F5-TTS API did not "
+                "come online within 6 minutes.\n"
+                f"Last health-check error: {last_health_error}\n\n"
+                f"Worker URL: {base_url}"
+            )
+
+        report(80, "Uploading the selected voice to the Kaggle GPU worker...")
+
+        with open(voice_path, "rb") as voice_file:
+            files = {
+                "voice": (
+                    Path(voice_path).name,
+                    voice_file,
+                    "audio/wav",
+                )
+            }
+            data = {"text": text}
+            headers = {"Authorization": f"Bearer {worker_key}"}
+
+            try:
+                result = requests.post(
+                    generate_url,
+                    headers=headers,
+                    data=data,
+                    files=files,
+                    timeout=1800,
+                )
+            except requests.RequestException as exc:
+                return None, (
+                    "Could not reach the Kaggle F5-TTS generation API.\n"
+                    f"{exc}\n\nWorker URL: {base_url}"
+                )
+
+        if result.status_code != 200:
+            detail = result.text[:5000]
+            try:
+                payload = result.json()
+                detail = str(payload.get("detail", detail))
+            except Exception:
+                pass
+
+            report(100, "Kaggle F5-TTS returned a generation error.")
+            return None, (
+                f"F5-TTS worker generation failed (HTTP {result.status_code}).\n"
+                f"{detail}\n\nWorker URL: {base_url}"
+            )
+
+        audio_bytes = result.content
+        if len(audio_bytes) < 1000 or not audio_bytes.startswith(b"RIFF"):
+            report(100, "Worker responded, but the returned file was not a valid WAV audio file.")
+            return None, (
+                "The Kaggle worker responded successfully, but the returned "
+                "payload was not a valid WAV audio file."
+            )
+
+        report(100, "F5-TTS generated the audio successfully and returned it to Streamlit.")
+        return audio_bytes, None
 
     except FileNotFoundError:
         report(100, "Kaggle CLI is not installed on the Streamlit server.")
@@ -669,7 +749,6 @@ print("Secure workspace: https://{n_domain}")
             details += str(exc.stdout)
         if exc.stderr:
             details += "\n" + str(exc.stderr)
-
         return None, (
             "Kaggle kernel push timed out after 600 seconds.\n"
             f"{details}".strip()
