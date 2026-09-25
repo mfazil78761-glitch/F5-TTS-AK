@@ -44,9 +44,10 @@ def push_database_updates_to_github(updated_db_dict):
                 "content": requests.utils.base64.b64encode(json.dumps({"users": updated_db_dict}, indent=2).encode()).decode(),
                 "sha": sha
             }
-            put_res = requests.put(api_url, headers=headers, json=payload)
-            if put_res.status_code in:
+                        put_res = requests.put(api_url, headers=headers, json=payload)
+            if put_res.status_code in [200, 201]:
                 return True
+
     except Exception as e:
         st.error(f"GitHub Sync pipeline error logs: {str(e)}")
     return False
