@@ -8,8 +8,8 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
-import re
 import time
+import re
 
 # ============================================================
 # F5-TTS PREMIUM SAAS ENTERPRISE
@@ -429,7 +429,7 @@ except Exception as exc:
         env["KAGGLE_KEY"] = k_token
 
         report(50, "Uploading the notebook and requesting the Kaggle T4 GPU...")
-        completed = subprocess.run(["kaggle", "kernels", "push", "-p", str(workspace)], env=env, capture_output=True, text=True, timeout=120, check=False)
+        completed = subprocess.run(["kaggle", "kernels", "push", "-p", str(workspace)], env=env, capture_output=True, text=True, timeout=900, check=False)
         combined_output = ((completed.stdout or "").strip() + "\n" + (completed.stderr or "").strip()).strip()
         if completed.returncode != 0:
             report(100, "Kaggle rejected the GPU worker request.")
@@ -444,32 +444,24 @@ except Exception as exc:
 
         # No foreground time limit: keep this request alive until Kaggle
         # actually finishes the submitted T4 generation job.
-        # Do not use `kaggle kernels status` here. Some current Kaggle
-        # API/CLI combinations return HTTP 404 from GetKernelSessionStatus
-        # even while the submitted kernel is actually running. We use live
-        # logs for progress and the output bundle as the completion signal.
-        last_output_check = 0.0
-
         while True:
-            now = time.monotonic()
-
-            # Logs are best-effort. A logs error must NOT be treated as a
-            # failed T4 job because the worker may still be running.
+            # Do NOT use `kaggle kernels status` here. In this deployment it
+            # can hit the GetKernelSessionStatus endpoint and return HTTP 404.
+            # The generated output/logs are the reliable signals we need.
             log_result = subprocess.run(
                 ["kaggle", "kernels", "logs", kernel_ref],
-                env=env, capture_output=True, text=True, timeout=15, check=False
+                env=env, capture_output=True, text=True, timeout=60, check=False
             )
             log_text = ((log_result.stdout or "") + "\n" + (log_result.stderr or "")).strip()
-            if log_text:
-                last_status = log_text[-3000:]
-
+            last_status = log_text[-2500:]
             log_upper = log_text.upper()
+
             if any(marker in log_upper for marker in (
-                "F5-TTS GENERATION STARTED",
-                "F5-TTS MODEL IS RUNNING",
-                "STARTING F5-TTS",
+                "KERNEL FAILED", "KERNEL ERROR", "TRACEBACK", "RUNTIMEERROR",
+                "EXCEPTION", "CANCELLED", "CANCELED", "FAILED TO RUN"
             )):
-                worker_generation_started = True
+                final_state = "error"
+                break
 
             percent_matches = re.findall(r"(?:\[|\s|^)(\d{1,3})(?:\.\d+)?%", log_text)
             parsed_percent = None
@@ -479,47 +471,31 @@ except Exception as exc:
                     parsed_percent = value
                     break
 
+            if any(marker in log_upper for marker in ("F5-TTS MODEL IS RUNNING", "STARTING F5-TTS", "F5-TTS GENERATION STARTED", "INFER")):
+                worker_generation_started = True
+
             if parsed_percent is not None and worker_generation_started:
+                # During the actual F5-TTS inference, show the percentage
+                # reported by the worker/logs directly.
                 last_worker_progress = parsed_percent
                 report(parsed_percent, f"🎙️ Voice generation: {parsed_percent}% complete")
             elif worker_generation_started:
-                report(max(1, last_worker_progress), "🎙️ Voice generation is running on the Kaggle T4...")
+                # If the current F5-TTS build does not expose a numeric
+                # inference percentage, keep the bar at the real generation
+                # phase rather than inventing a fake percentage.
+                report(max(0, last_worker_progress), "🎙️ Voice generation is running on the Kaggle T4...")
             else:
                 report(15, "⏳ Kaggle T4 is starting the F5-TTS worker...")
 
-            # Check the output bundle periodically. A generated.wav file is
-            # the reliable completion signal for this worker.
-            if now - last_output_check >= 10:
-                last_output_check = now
-                download = subprocess.run(
-                    ["kaggle", "kernels", "output", kernel_ref, "-p", str(output_dir), "-o", "-q"],
-                    env=env, capture_output=True, text=True, timeout=60, check=False
-                )
-                downloaded_text = ((download.stdout or "") + "\n" + (download.stderr or "")).strip()
-
-                if download.returncode == 0:
-                    status_files = list(output_dir.rglob("f5tts_status.json"))
-                    audio_files = list(output_dir.rglob("generated.wav"))
-
-                    if status_files:
-                        try:
-                            status_payload = json.loads(status_files[0].read_text(encoding="utf-8"))
-                        except Exception:
-                            status_payload = {}
-
-                        if status_payload.get("status") == "error":
-                            final_state = "error"
-                            last_status = str(status_payload.get("message", "F5-TTS error"))
-                            break
-
-                    if audio_files:
-                        final_state = "complete"
-                        break
-
-                # While the worker is running, no output is normal. In
-                # particular, do not turn a 404 response into a fake failure.
-                if downloaded_text and "404" not in downloaded_text.upper():
-                    last_status = downloaded_text[-3000:]
+            # Probe Kaggle output without relying on the broken session-status
+            # endpoint. Once generated.wav appears, generation is complete.
+            output_probe = subprocess.run(
+                ["kaggle", "kernels", "output", kernel_ref, "-p", str(output_dir), "-o", "-q"],
+                env=env, capture_output=True, text=True, timeout=120, check=False
+            )
+            if output_probe.returncode == 0 and list(output_dir.rglob("generated.wav")):
+                final_state = "complete"
+                break
 
             final_state = "running"
             time.sleep(3)
@@ -580,10 +556,23 @@ def poll_pending_kaggle_job(job):
         env["KAGGLE_API_TOKEN"] = k_token
         env["KAGGLE_KEY"] = k_token
 
-        # Do not call `kaggle kernels status`: some Kaggle API/CLI
-        # combinations return HTTP 404 for GetKernelSessionStatus while the
-        # actual notebook continues running. Output availability is used as
-        # the completion signal instead.
+        result = subprocess.run(
+            ["kaggle", "kernels", "status", kernel_ref],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        status_text = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        upper = status_text.upper()
+
+        if "ERROR" in upper or "FAILED" in upper or "CANCEL" in upper:
+            return "error", None, "Kaggle job failed or was cancelled.\n\n" + status_text[-5000:]
+
+        if "COMPLETE" not in upper and "SUCCEEDED" not in upper:
+            return "running", None, status_text[-2000:]
+
         download = subprocess.run(
             ["kaggle", "kernels", "output", kernel_ref, "-p", str(output_dir), "-o", "-q"],
             env=env,
@@ -592,16 +581,9 @@ def poll_pending_kaggle_job(job):
             timeout=60,
             check=False,
         )
-        details = ((download.stdout or "") + "\n" + (download.stderr or "")).strip()
-
         if download.returncode != 0:
-            return "running", None, details[-2000:] or "Kaggle T4 is still running."
-
-        status_files = list(output_dir.rglob("f5tts_status.json"))
-        audio_files = list(output_dir.rglob("generated.wav"))
-
-        if not audio_files:
-            return "running", None, "Kaggle T4 is still running; generated.wav is not available yet."
+            details = ((download.stdout or "") + "\n" + (download.stderr or "")).strip()
+            return "error", None, "Kaggle completed, but output download failed.\n" + details[:5000]
 
         status_files = list(output_dir.rglob("f5tts_status.json"))
         if status_files:
