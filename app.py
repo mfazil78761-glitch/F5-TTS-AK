@@ -390,7 +390,7 @@ import uvicorn
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
-PORT = 7860
+PORT = 8787
 WORKER_KEY = os.environ.get("F5_WORKER_KEY", "").strip()
 NGROK_AUTH = os.environ.get("F5_NGROK_AUTH_TOKEN", "").strip()
 NGROK_DOMAIN = os.environ.get("F5_NGROK_STATIC_DOMAIN", "").strip()
@@ -420,6 +420,15 @@ def get_model():
                 )
                 print("F5-TTS model loaded.", flush=True)
     return model_holder["model"]
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "F5-TTS Private GPU Worker",
+        "status": "online",
+        "model_loaded": model_holder["model"] is not None,
+    }
 
 
 @app.get("/health")
@@ -492,6 +501,10 @@ if __name__ == "__main__":
     from pyngrok import ngrok
 
     ngrok.set_auth_token(NGROK_AUTH)
+    try:
+        ngrok.kill()
+    except Exception:
+        pass
 
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
@@ -506,9 +519,13 @@ if __name__ == "__main__":
             pass
         time.sleep(1)
     else:
-        raise RuntimeError("Local F5-TTS API did not start on port 7860.")
+        raise RuntimeError("Local F5-TTS API did not start on port 8787.")
 
-    tunnel = ngrok.connect(addr=PORT, proto="http", domain=NGROK_DOMAIN)
+    tunnel = ngrok.connect(
+        addr=f"127.0.0.1:{PORT}",
+        proto="http",
+        domain=NGROK_DOMAIN,
+    )
     print("F5-TTS public API:", tunnel.public_url, flush=True)
     print("F5-TTS worker is ready.", flush=True)
 
@@ -546,7 +563,7 @@ subprocess.check_call([
 ])
 
 subprocess.run(
-    ["bash", "-lc", "fuser -k 7860/tcp || true"],
+    ["bash", "-lc", "fuser -k 8787/tcp || true"],
     check=False,
 )
 
@@ -657,6 +674,7 @@ subprocess.run(
 
         base_url = f"https://{n_domain}"
         health_url = f"{base_url}/health"
+        root_url = f"{base_url}/"
         generate_url = f"{base_url}/generate"
 
         last_health_error = ""
@@ -666,7 +684,21 @@ subprocess.run(
                 if health.ok:
                     report(75, "Kaggle GPU worker is online. Sending the reference voice and text...")
                     break
-                last_health_error = f"HTTP {health.status_code}: {health.text[:500]}"
+
+                # A 404 here means the static Ngrok domain is still pointing at an
+                # older FastAPI service. Probe the root route so the diagnostic is
+                # explicit rather than looking like an F5-TTS timeout.
+                if health.status_code == 404:
+                    try:
+                        root_probe = requests.get(root_url, timeout=8)
+                        last_health_error = (
+                            f"HTTP 404 on /health; root returned "
+                            f"HTTP {root_probe.status_code}: {root_probe.text[:500]}"
+                        )
+                    except requests.RequestException as root_exc:
+                        last_health_error = f"HTTP 404 on /health; root probe failed: {root_exc}"
+                else:
+                    last_health_error = f"HTTP {health.status_code}: {health.text[:500]}"
             except requests.RequestException as exc:
                 last_health_error = str(exc)
 
