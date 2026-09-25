@@ -23,7 +23,8 @@ GITHUB_PAT_TOKEN = str(st.secrets.get("GITHUB_PAT_TOKEN", "")).strip()
 
 def fetch_live_database():
     try:
-        res = requests.get(DB_URL, timeout=15)
+        # Cache bypass lagaya hai takay live data turant refresh ho kar aye
+        res = requests.get(f"{DB_URL}?nocache={int(datetime.now().timestamp())}", timeout=15)
         if res.status_code == 200:
             return res.json().get("users", {})
     except Exception:
@@ -52,7 +53,7 @@ def push_database_updates_to_github(updated_db_dict):
     except Exception:
         return False
 
-# --- PERSISTENT STATE RECOVERY MANAGER (ANTI-LOGOUT ON REFRESH) ---
+# --- LIVE REFRESH DATABASE LOAD ---
 user_db = fetch_live_database()
 
 if "auth_session" not in st.session_state:
@@ -62,7 +63,7 @@ if "current_user" not in st.session_state:
 if "current_password" not in st.session_state:
     st.session_state.current_password = ""
 
-# Dynamic check parameter allocation
+# Persistent State Parameter Check
 query_params = st.query_params
 if not st.session_state.auth_session and "user" in query_params and "auth" in query_params:
     u_state = query_params["user"]
@@ -102,7 +103,7 @@ if not st.session_state.auth_session:
                 st.error("Unauthorized profile.")
     st.stop()
 
-# --- RE-VALIDATING SYSTEM PROFILE MAPPINGS ---
+# --- VALIDATING ACTIVE LIVE PROFILE CODES ---
 active_username = st.session_state.current_user
 account_profile = user_db[active_username]
 
@@ -112,7 +113,7 @@ if account_profile.get("is_revoked", False):
     st.error("🚨 Access Revoked by Admin. Session Terminated!")
     st.stop()
 
-# --- SIDEBAR INTERFACE NAV CONTROLLER (HAMBURGER SWITCH) ---
+# --- SIDEBAR NAV HAMBURGER TRIGGER ---
 with st.sidebar:
     st.write(f"### 🤗 Active User: **{active_username.upper()}**")
     if account_profile.get("is_admin", False):
@@ -130,7 +131,7 @@ with st.sidebar:
         st.query_params.clear()
         st.rerun()
 
-# --- MASTER ADMIN INTERFACE VIEWS ---
+# --- ADMINISTRATIVE DASHBOARD CONTROLS ---
 if account_profile.get("is_admin", False):
     if app_page_mode == "🗃️ Active Users Registry":
         st.title("👑 Master Administrator User Management Dashboard")
@@ -139,6 +140,7 @@ if account_profile.get("is_admin", False):
         for u_name, u_info in list(user_db.items()):
             if u_info.get("is_admin", False): continue
             active_users_exist = True
+            
             status_badge = "🟢 Active Status" if not u_info.get("is_revoked", False) else "🔴 Access Revoked"
             st.markdown(f"#### Profile Handle: `{u_name}` | Status: **{status_badge}**")
 
@@ -178,7 +180,7 @@ if account_profile.get("is_admin", False):
                 if push_database_updates_to_github(user_db): st.rerun()
     st.stop()
 
-# --- REGULAR CLIENT CARD LAYOUTS ---
+# --- REGULAR CLIENT SaaS SCREEN INTERFACE ---
 st.title("🎤 F5-TTS Premium SaaS")
 
 expiry_target_obj = datetime.strptime(account_profile["expiry_timestamp"], "%Y-%m-%d %H:%M:%S")
@@ -200,5 +202,3 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-user_voice_dir = f"cloud_vault/{active_username}/voices"
-os.makedirs(user_voice_dir, exist_ok=True)
