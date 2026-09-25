@@ -18,7 +18,8 @@ REPO_NAME = "F5-TTS-AK"
 DB_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/users_db.json"
 
 # Store the GitHub PAT in Streamlit secrets instead of hard-coding it.
-GITHUB_PAT_TOKEN = st.secrets.get("GITHUB_PAT_TOKEN", "")
+# strip() removes accidental spaces/newlines copied into Streamlit Secrets.
+GITHUB_PAT_TOKEN = str(st.secrets.get("GITHUB_PAT_TOKEN", "")).strip()
 
 
 def fetch_live_database():
@@ -44,9 +45,9 @@ def fetch_live_database():
 
 def push_database_updates_to_github(updated_db_dict):
     if not GITHUB_PAT_TOKEN:
-        st.warning(
-            "⚠️ Admin GitHub PAT Token missing. "
-            "Web UI updates won't save automatically!"
+        st.error(
+            "GitHub PAT missing. Add a valid GITHUB_PAT_TOKEN "
+            "to Streamlit Secrets."
         )
         return False
 
@@ -57,53 +58,111 @@ def push_database_updates_to_github(updated_db_dict):
 
     headers = {
         "Authorization": f"Bearer {GITHUB_PAT_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "F5-TTS-Cloud-App",
     }
 
     try:
+        # Check authentication first so HTTP 401 has a clear explanation.
+        auth_res = requests.get(
+            "https://api.github.com/user",
+            headers=headers,
+            timeout=15,
+        )
+
+        if auth_res.status_code == 401:
+            st.error(
+                "GitHub PAT authentication failed (HTTP 401). "
+                "The token in Streamlit Secrets is invalid, expired, "
+                "revoked, or copied incorrectly. Replace "
+                "GITHUB_PAT_TOKEN with a valid GitHub token."
+            )
+            return False
+
+        if auth_res.status_code != 200:
+            st.error(
+                f"GitHub authentication check failed: HTTP "
+                f"{auth_res.status_code} - {auth_res.text}"
+            )
+            return False
+
         get_res = requests.get(api_url, headers=headers, timeout=15)
 
-        if get_res.status_code == 200:
-            sha = get_res.json().get("sha")
-
-            payload = {
-                "message": "Automated update from Web UI Panel Admin Action",
-                "content": requests.utils.base64.b64encode(
-                    json.dumps(
-                        {"users": updated_db_dict},
-                        indent=2
-                    ).encode()
-                ).decode(),
-                "sha": sha,
-            }
-
-            # Fixed indentation: this belongs inside the try block.
-            put_res = requests.put(
-                api_url,
-                headers=headers,
-                json=payload,
-                timeout=15,
-            )
-
-            # GitHub Contents API normally returns 200 for update
-            # and 201 for creation.
-            if put_res.status_code in (200, 201):
-                return True
-
+        if get_res.status_code == 404:
             st.error(
-                f"GitHub update failed: HTTP {put_res.status_code} "
-                f"- {put_res.text}"
+                f"users_db.json was not found in {REPO_OWNER}/{REPO_NAME}."
             )
-        else:
-            st.error(
-                f"GitHub database read failed: HTTP {get_res.status_code}"
-            )
+            return False
 
+        if get_res.status_code == 403:
+            st.error(
+                "GitHub returned HTTP 403. The token is valid, but it "
+                "does not have repository permission. For a fine-grained "
+                "PAT, give this repository access and enable "
+                "Contents: Read and write."
+            )
+            return False
+
+        if get_res.status_code != 200:
+            st.error(
+                f"GitHub database read failed: HTTP {get_res.status_code} "
+                f"- {get_res.text}"
+            )
+            return False
+
+        sha = get_res.json().get("sha")
+
+        encoded_content = requests.utils.base64.b64encode(
+            json.dumps(
+                {"users": updated_db_dict},
+                indent=2,
+            ).encode("utf-8")
+        ).decode("ascii")
+
+        payload = {
+            "message": "Automated update from Web UI Panel Admin Action",
+            "content": encoded_content,
+            "sha": sha,
+        }
+
+        put_res = requests.put(
+            api_url,
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+
+        if put_res.status_code in (200, 201):
+            return True
+
+        if put_res.status_code == 401:
+            st.error(
+                "GitHub returned HTTP 401 while saving. "
+                "Refresh/re-add GITHUB_PAT_TOKEN in Streamlit Secrets."
+            )
+            return False
+
+        if put_res.status_code == 403:
+            st.error(
+                "GitHub returned HTTP 403 while saving. "
+                "Your PAT needs Contents: Read and write permission "
+                f"for {REPO_OWNER}/{REPO_NAME}."
+            )
+            return False
+
+        st.error(
+            f"GitHub update failed: HTTP {put_res.status_code} "
+            f"- {put_res.text}"
+        )
+        return False
+
+    except requests.RequestException as e:
+        st.error(f"GitHub network error: {str(e)}")
+        return False
     except Exception as e:
-        st.error(f"GitHub Sync pipeline error logs: {str(e)}")
-
-    return False
+        st.error(f"GitHub Sync pipeline error: {str(e)}")
+        return False
 
 
 user_db = fetch_live_database()
