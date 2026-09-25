@@ -436,7 +436,7 @@ except Exception as exc:
         report(60, "Kaggle accepted the notebook. Waiting for the T4 job...")
         final_state = ""
         last_status = ""
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 360
         while time.monotonic() < deadline:
             status_result = subprocess.run(["kaggle", "kernels", "status", kernel_ref], env=env, capture_output=True, text=True, timeout=15, check=False)
             status_text = ((status_result.stdout or "") + "\n" + (status_result.stderr or "")).strip()
@@ -449,12 +449,12 @@ except Exception as exc:
                 final_state = "complete"
                 break
             final_state = "running"
-            elapsed = int(60 - max(0, deadline - time.monotonic()))
-            report(min(82, 60 + int((elapsed / 60) * 22)), f"Kaggle T4 job status: running ({elapsed}s/60s)")
+            elapsed = int(360 - max(0, deadline - time.monotonic()))
+            report(min(82, 60 + int((elapsed / 360) * 22)), f"Kaggle T4 job status: running ({elapsed}s/360s)")
             time.sleep(3)
 
         if final_state != "complete":
-            # The one-minute limit is only the browser/request wait.
+            # The six-minute request window is only the initial foreground wait.
             # Kaggle keeps the submitted job running; Streamlit polls it
             # in the background so a slow GPU startup does not become a
             # false generation failure.
@@ -768,7 +768,7 @@ elif page == "🎤 Voice Cloning":
 elif page == "🔊 Text To Speech":
     st.title("🔊 Text To Speech")
 
-    # Continue a Kaggle job after the initial 60-second request window.
+    # Continue a Kaggle job if the six-minute request window expires while Kaggle is still running.
     pending_job = st.session_state.get("pending_kaggle_job")
     if pending_job:
         @st.fragment(run_every="5s")
@@ -936,7 +936,7 @@ elif page == "🔊 Text To Speech":
                                 expanded=True,
                             )
                             st.info(
-                                "⏳ The first 60 seconds only cover request submission. "
+                                "⏳ Kaggle is still processing the request. The six-minute window was reached; the job may continue in the background. "
                                 "Kaggle will continue the GPU job and this page will check it automatically."
                             )
 
