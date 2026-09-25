@@ -172,6 +172,10 @@ defaults = {
     "current_user": "",
     "current_password": "",
     "page": "Dashboard",
+    "pending_kaggle_job": None,
+    "completed_audio": None,
+    "completed_audio_chars": 0,
+    "completed_audio_message": "",
 }
 
 for key, default in defaults.items():
@@ -422,7 +426,7 @@ except Exception as exc:
         env["KAGGLE_KEY"] = k_token
 
         report(50, "Uploading the notebook and requesting the Kaggle T4 GPU...")
-        completed = subprocess.run(["kaggle", "kernels", "push", "-p", str(workspace)], env=env, capture_output=True, text=True, timeout=60, check=False)
+        completed = subprocess.run(["kaggle", "kernels", "push", "-p", str(workspace)], env=env, capture_output=True, text=True, timeout=120, check=False)
         combined_output = ((completed.stdout or "").strip() + "\n" + (completed.stderr or "").strip()).strip()
         if completed.returncode != 0:
             report(100, "Kaggle rejected the GPU worker request.")
@@ -450,8 +454,17 @@ except Exception as exc:
             time.sleep(3)
 
         if final_state != "complete":
-            report(100, "Kaggle job did not finish within 1 minute.")
-            return None, "Kaggle T4 job did not finish within the 1-minute limit.\n\nLatest Kaggle status:\n" + last_status
+            # The one-minute limit is only the browser/request wait.
+            # Kaggle keeps the submitted job running; Streamlit polls it
+            # in the background so a slow GPU startup does not become a
+            # false generation failure.
+            report(100, "Kaggle T4 job is still running. Background polling will continue.")
+            return {
+                "pending": True,
+                "kernel_ref": kernel_ref,
+                "output_dir": str(output_dir),
+                "last_status": last_status,
+            }, None
 
         report(85, "Kaggle finished the T4 job. Downloading the generated WAV...")
         download = subprocess.run(["kaggle", "kernels", "output", kernel_ref, "-p", str(output_dir), "-o", "-q"], env=env, capture_output=True, text=True, timeout=60, check=False)
@@ -487,6 +500,76 @@ except Exception as exc:
     except Exception as exc:
         report(100, "The Kaggle T4 job stopped with an unexpected error.")
         return None, f"Kaggle infrastructure error: {exc}"
+
+
+def poll_pending_kaggle_job(job):
+    """Poll a previously submitted Kaggle job without starting a second job."""
+    try:
+        k_user = str(account_profile.get("kaggle_username", "")).strip()
+        k_token = str(account_profile.get("kaggle_token", "")).strip()
+        kernel_ref = str(job.get("kernel_ref", "")).strip()
+        output_dir = Path(str(job.get("output_dir", "")))
+        if not k_user or not k_token or not kernel_ref or not output_dir:
+            return "error", None, "Pending Kaggle job information is incomplete."
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["KAGGLE_USERNAME"] = k_user
+        env["KAGGLE_API_TOKEN"] = k_token
+        env["KAGGLE_KEY"] = k_token
+
+        result = subprocess.run(
+            ["kaggle", "kernels", "status", kernel_ref],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        status_text = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        upper = status_text.upper()
+
+        if "ERROR" in upper or "FAILED" in upper or "CANCEL" in upper:
+            return "error", None, "Kaggle job failed or was cancelled.\n\n" + status_text[-5000:]
+
+        if "COMPLETE" not in upper and "SUCCEEDED" not in upper:
+            return "running", None, status_text[-2000:]
+
+        download = subprocess.run(
+            ["kaggle", "kernels", "output", kernel_ref, "-p", str(output_dir), "-o", "-q"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if download.returncode != 0:
+            details = ((download.stdout or "") + "\n" + (download.stderr or "")).strip()
+            return "error", None, "Kaggle completed, but output download failed.\n" + details[:5000]
+
+        status_files = list(output_dir.rglob("f5tts_status.json"))
+        if status_files:
+            try:
+                status_payload = json.loads(status_files[0].read_text(encoding="utf-8"))
+            except Exception:
+                status_payload = {}
+            if status_payload.get("status") != "success":
+                return "error", None, "F5-TTS reported an error:\n" + str(status_payload.get("message", "Unknown F5-TTS error"))
+
+        audio_files = list(output_dir.rglob("generated.wav"))
+        if not audio_files:
+            return "error", None, "Kaggle completed, but generated.wav was not found in its output."
+        audio_bytes = audio_files[0].read_bytes()
+        if len(audio_bytes) < 1000 or not audio_bytes.startswith(b"RIFF"):
+            return "error", None, "Kaggle returned an invalid generated.wav file."
+        return "complete", audio_bytes, "F5-TTS audio is ready."
+
+    except FileNotFoundError:
+        return "error", None, "Kaggle CLI was not found on the Streamlit server."
+    except subprocess.TimeoutExpired:
+        return "running", None, "Kaggle status check is taking longer than expected; polling will retry."
+    except Exception as exc:
+        return "error", None, f"Kaggle polling error: {exc}"
 
 
 # -------------------- SIDEBAR --------------------
@@ -685,6 +768,37 @@ elif page == "🎤 Voice Cloning":
 elif page == "🔊 Text To Speech":
     st.title("🔊 Text To Speech")
 
+    # Continue a Kaggle job after the initial 60-second request window.
+    pending_job = st.session_state.get("pending_kaggle_job")
+    if pending_job:
+        @st.fragment(run_every="5s")
+        def kaggle_background_status():
+            state, audio_bytes, detail = poll_pending_kaggle_job(pending_job)
+            if state == "running":
+                st.info("⏳ Kaggle T4 is still running. This page will update automatically.")
+                if detail:
+                    st.caption(detail[-500:])
+            elif state == "complete":
+                char_amount = int(st.session_state.get("pending_kaggle_chars", 0))
+                if char_amount and deduct_characters(char_amount):
+                    st.session_state.completed_audio_message = f"✅ Audio generated successfully. {char_amount:,} characters deducted."
+                else:
+                    st.session_state.completed_audio_message = "⚠️ Audio generated, but the character balance could not be updated."
+                st.session_state.completed_audio = audio_bytes
+                st.session_state.completed_audio_chars = char_amount
+                st.session_state.pending_kaggle_job = None
+                st.success(st.session_state.completed_audio_message)
+                st.rerun()
+            else:
+                st.session_state.pending_kaggle_job = None
+                st.error(detail)
+                st.rerun()
+        kaggle_background_status()
+
+    if st.session_state.get("completed_audio"):
+        st.success(st.session_state.get("completed_audio_message", "Audio generated successfully."))
+        st.audio(st.session_state.completed_audio, format="audio/wav")
+
     voices = get_saved_voices()
 
     if not voices:
@@ -813,7 +927,20 @@ elif page == "🔊 Text To Speech":
                         # not proof that audio was generated.
                         audio_received = False
 
-                        if isinstance(generated, bytes):
+                        if isinstance(generated, dict) and generated.get("pending"):
+                            st.session_state.pending_kaggle_job = generated
+                            st.session_state.pending_kaggle_chars = current_count
+                            generation_status.update(
+                                label="⏳ Kaggle T4 job submitted; background polling active",
+                                state="complete",
+                                expanded=True,
+                            )
+                            st.info(
+                                "⏳ The first 60 seconds only cover request submission. "
+                                "Kaggle will continue the GPU job and this page will check it automatically."
+                            )
+
+                        elif isinstance(generated, bytes):
                             audio_received = True
                             st.audio(
                                 generated,
@@ -841,6 +968,7 @@ elif page == "🔊 Text To Speech":
                                 f"**Secure workspace:** [{generated}]({generated})"
                             )
 
+                        pending_result = isinstance(generated, dict) and generated.get("pending")
                         if audio_received:
                             if deduct_characters(current_count):
                                 st.success(
@@ -858,7 +986,7 @@ elif page == "🔊 Text To Speech":
                                 status_box.warning(
                                     "⚠️ Audio received, but wallet update failed."
                                 )
-                        else:
+                        elif not pending_result:
                             status_box.warning(
                                 "⚠️ No audio file was returned, so no characters were deducted."
                             )
