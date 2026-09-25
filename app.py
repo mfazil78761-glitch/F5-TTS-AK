@@ -322,7 +322,7 @@ def save_kaggle_settings(
     return push_database_updates_to_github(user_db)
 
 
-def generate_with_kaggle(text, voice_path):
+def generate_with_kaggle(text, voice_path, progress_callback=None):
     """
     Creates a private Kaggle GPU notebook workspace for the active user.
 
@@ -336,7 +336,15 @@ def generate_with_kaggle(text, voice_path):
       - launches the official F5-TTS Gradio inference app
       - binds the user's Ngrok static domain
     """
+    def report(percent, message):
+        if progress_callback is not None:
+            try:
+                progress_callback(percent, message)
+            except Exception:
+                pass
+
     try:
+        report(5, "Checking Kaggle and Ngrok connection fields...")
         # 1. Extract the four profile credentials/settings.
         k_user = str(
             account_profile.get("kaggle_username", "")
@@ -382,6 +390,8 @@ def generate_with_kaggle(text, voice_path):
             c if c.isalnum() or c == "-" else "-"
             for c in raw_slug
         ).strip("-")[:80]
+
+        report(15, "Credentials look valid. Preparing the private Kaggle GPU worker...")
 
         workspace = Path(
             tempfile.mkdtemp(
@@ -572,6 +582,8 @@ print("Secure workspace: https://{n_domain}")
             encoding="utf-8",
         )
 
+        report(35, "Building active_worker.ipynb and F5-TTS launcher...")
+
         # 3. Generate kernel-metadata.json.
         metadata = {
             "id": f"{k_user}/{kernel_slug}",
@@ -597,12 +609,16 @@ print("Secure workspace: https://{n_domain}")
             encoding="utf-8",
         )
 
+        report(50, "Worker package is ready. Connecting to your Kaggle account...")
+
         # 4. Set runtime Kaggle environment blocks.
         env = os.environ.copy()
         env["KAGGLE_USERNAME"] = k_user
         env["KAGGLE_API_TOKEN"] = k_token
         # Compatibility with legacy Kaggle API authentication.
         env["KAGGLE_KEY"] = k_token
+
+        report(60, "Uploading notebook to Kaggle and requesting the GPU worker...")
 
         # 5. Push the notebook to Kaggle and let Kaggle run it.
         completed = subprocess.run(
@@ -628,9 +644,11 @@ print("Secure workspace: https://{n_domain}")
 
         # 6. Success returns the secure Ngrok workspace URL.
         if completed.returncode == 0:
+            report(100, "Kaggle accepted the worker request. Secure workspace is being prepared...")
             return f"https://{n_domain}", None
 
         # Error returns the CLI trace so the caller can avoid charging.
+        report(100, "Kaggle rejected the worker request.")
         return None, (
             "Kaggle kernel push failed "
             f"(exit code {completed.returncode}).\n"
@@ -638,12 +656,14 @@ print("Secure workspace: https://{n_domain}")
         )
 
     except FileNotFoundError:
+        report(100, "Kaggle CLI is not installed on the Streamlit server.")
         return None, (
             "Kaggle CLI was not found on the Streamlit server. "
             "Install it with: pip install kaggle"
         )
 
     except subprocess.TimeoutExpired as exc:
+        report(100, "Kaggle upload timed out.")
         details = ""
         if exc.stdout:
             details += str(exc.stdout)
@@ -656,6 +676,7 @@ print("Secure workspace: https://{n_domain}")
         )
 
     except Exception as exc:
+        report(100, "The GPU worker setup stopped with an unexpected error.")
         return None, f"Kaggle infrastructure error: {exc}"
 
 
@@ -928,52 +949,113 @@ elif page == "🔊 Text To Speech":
                 )
 
             else:
-                generated, error = generate_with_kaggle(
-                    text_input,
-                    selected_path,
+                progress_box = st.empty()
+                progress_bar = st.progress(0)
+                status_box = st.empty()
+
+                def generation_progress(percent, message):
+                    progress_bar.progress(
+                        max(0, min(100, int(percent)))
+                    )
+                    status_box.info(
+                        f"🔄 {message}"
+                    )
+
+                generation_progress(
+                    2,
+                    "Generation request started. Do not close this page.",
                 )
 
-                if error:
-                    st.error(error)
+                with st.status(
+                    "⚙️ F5-TTS generation in progress...",
+                    expanded=True,
+                ) as generation_status:
+                    generated, error = generate_with_kaggle(
+                        text_input,
+                        selected_path,
+                        progress_callback=generation_progress,
+                    )
 
-                else:
-                    if deduct_characters(current_count):
+                    if error:
+                        generation_status.update(
+                            label="❌ Generation stopped",
+                            state="error",
+                            expanded=True,
+                        )
+                        progress_bar.progress(100)
+                        status_box.error(
+                            "The request did not complete. See the diagnostic below."
+                        )
+                        st.error(error)
+                        st.code(
+                            error,
+                            language="text",
+                        )
+
+                    else:
+                        generation_status.update(
+                            label="✅ Kaggle worker accepted the request",
+                            state="complete",
+                            expanded=True,
+                        )
+
+                        # Only charge the wallet when an actual audio
+                        # result was returned. A workspace URL alone is
+                        # not proof that audio was generated.
+                        audio_received = False
+
                         if isinstance(generated, bytes):
+                            audio_received = True
                             st.audio(
                                 generated,
                                 format="audio/wav",
                             )
-                            st.success(
-                                f"{current_count:,} characters deducted."
-                            )
+
                         elif isinstance(generated, dict):
                             audio_url = generated.get(
                                 "audio_url"
                             )
 
                             if audio_url:
+                                audio_received = True
                                 st.audio(audio_url)
                             else:
                                 st.json(generated)
 
-                            st.success(
-                                f"{current_count:,} characters deducted."
+                        elif isinstance(generated, str):
+                            st.warning(
+                                "⚠️ Kaggle accepted the worker, but this request "
+                                "returned only the workspace URL — no audio file "
+                                "was returned yet."
                             )
-                        else:
-                            st.success(
-                                f"Kaggle workspace ready: {generated}"
-                            )
-                            st.success(
-                                f"{current_count:,} characters deducted."
+                            st.markdown(
+                                f"**Secure workspace:** [{generated}]({generated})"
                             )
 
-                        st.rerun()
-                    else:
-                        st.error(
-                            "Generation completed but character "
-                            "balance could not be updated. "
-                            "Contact the administrator."
-                        )
+                        if audio_received:
+                            if deduct_characters(current_count):
+                                st.success(
+                                    f"✅ Audio generated successfully. "
+                                    f"{current_count:,} characters deducted."
+                                )
+                                status_box.success(
+                                    "✅ Audio output received and wallet updated."
+                                )
+                            else:
+                                st.error(
+                                    "Audio was generated, but the character "
+                                    "balance could not be updated. Contact the administrator."
+                                )
+                                status_box.warning(
+                                    "⚠️ Audio received, but wallet update failed."
+                                )
+                        else:
+                            status_box.warning(
+                                "⚠️ No audio file was returned, so no characters were deducted."
+                            )
+
+                        progress_box.empty()
+
 
 
 # ============================================================
