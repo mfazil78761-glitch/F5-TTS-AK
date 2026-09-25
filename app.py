@@ -2,6 +2,9 @@ import streamlit as st
 import json
 import os
 import base64
+import subprocess
+import tempfile
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
@@ -28,13 +31,6 @@ GITHUB_PAT_TOKEN = str(st.secrets.get("GITHUB_PAT_TOKEN", "")).strip()
 
 BASE_VOICE_DIR = Path("cloud_vault")
 BASE_VOICE_DIR.mkdir(parents=True, exist_ok=True)
-
-# Optional Kaggle notebook/API endpoint.
-# Set this in Streamlit Secrets as KAGGLE_TTS_ENDPOINT when the Kaggle
-# notebook exposes an authenticated generation endpoint.
-KAGGLE_TTS_ENDPOINT = str(
-    st.secrets.get("KAGGLE_TTS_ENDPOINT", "")
-).strip()
 
 # -------------------- UI STYLE --------------------
 
@@ -84,6 +80,8 @@ def fallback_database():
             "is_admin": True,
             "kaggle_username": "",
             "kaggle_token": "",
+            "ngrok_auth_token": "",
+            "ngrok_static_domain": "",
         }
     }
 
@@ -311,78 +309,354 @@ def deduct_characters(amount):
     return push_database_updates_to_github(user_db)
 
 
-def save_kaggle_settings(username, token):
+def save_kaggle_settings(
+    username,
+    token,
+    ngrok_auth_token,
+    ngrok_static_domain,
+):
     account_profile["kaggle_username"] = username.strip()
     account_profile["kaggle_token"] = token.strip()
+    account_profile["ngrok_auth_token"] = ngrok_auth_token.strip()
+    account_profile["ngrok_static_domain"] = ngrok_static_domain.strip()
     return push_database_updates_to_github(user_db)
 
 
 def generate_with_kaggle(text, voice_path):
     """
-    Optional connector for a Kaggle notebook/API endpoint.
+    Creates a private Kaggle GPU notebook workspace for the active user.
 
-    The endpoint must accept JSON containing:
-        username
-        token
-        text
-        voice_name
-        voice_path
+    This runs on the Streamlit server/container. It cannot execute a
+    command directly on the user's phone or PC terminal.
 
-    It may return JSON or an audio response.
+    The generated Kaggle notebook:
+      - frees port 7860
+      - installs pyngrok and f5-tts
+      - starts master_wrapper_launcher.py in the background
+      - launches the official F5-TTS Gradio inference app
+      - binds the user's Ngrok static domain
     """
-    if not KAGGLE_TTS_ENDPOINT:
-        return None, (
-            "Kaggle TTS endpoint is not configured yet. "
-            "Set KAGGLE_TTS_ENDPOINT in Streamlit Secrets."
+    try:
+        # 1. Extract the four profile credentials/settings.
+        k_user = str(
+            account_profile.get("kaggle_username", "")
+        ).strip()
+
+        k_token = str(
+            account_profile.get("kaggle_token", "")
+        ).strip()
+
+        n_auth = str(
+            account_profile.get("ngrok_auth_token", "")
+        ).strip()
+
+        n_domain = str(
+            account_profile.get("ngrok_static_domain", "")
+        ).strip()
+
+        if not k_user:
+            return None, "Kaggle Username is missing in Settings."
+
+        if not k_token:
+            return None, "Kaggle API Token is missing in Settings."
+
+        if not n_auth:
+            return None, "Ngrok Auth Token is missing in Settings."
+
+        if not n_domain:
+            return None, "Ngrok Static Domain is missing in Settings."
+
+        n_domain = (
+            n_domain.replace("https://", "")
+            .replace("http://", "")
+            .strip("/")
         )
 
-    kaggle_username = str(
-        account_profile.get("kaggle_username", "")
-    ).strip()
-
-    kaggle_token = str(
-        account_profile.get("kaggle_token", "")
-    ).strip()
-
-    if not kaggle_username or not kaggle_token:
-        return None, (
-            "Add your Kaggle username and API token in Settings first."
+        # Create an isolated temporary push workspace.
+        raw_slug = (
+            f"f5tts-{active_username.lower()}-"
+            f"{uuid.uuid4().hex[:10]}"
         )
 
-    payload = {
-        "username": kaggle_username,
-        "token": kaggle_token,
-        "text": text,
-        "voice_name": voice_path.stem,
-        "voice_path": str(voice_path),
-    }
+        kernel_slug = "".join(
+            c if c.isalnum() or c == "-" else "-"
+            for c in raw_slug
+        ).strip("-")[:80]
+
+        workspace = Path(
+            tempfile.mkdtemp(
+                prefix="f5tts_kaggle_"
+            )
+        )
+
+        notebook_path = workspace / "active_worker.ipynb"
+        launcher_path = workspace / "master_wrapper_launcher.py"
+        metadata_path = workspace / "kernel-metadata.json"
+
+        # 2. Build the master wrapper launcher.
+        launcher_code = r"""import os
+import subprocess
+import sys
+
+PORT = 7860
+
+
+def kill_port():
+    subprocess.run(
+        ["bash", "-lc", "fuser -k 7860/tcp || true"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def main():
+    kill_port()
+
+    ngrok_auth = os.environ.get(
+        "F5_NGROK_AUTH_TOKEN",
+        "",
+    ).strip()
+
+    ngrok_domain = os.environ.get(
+        "F5_NGROK_STATIC_DOMAIN",
+        "",
+    ).strip()
+
+    if not ngrok_auth:
+        raise RuntimeError(
+            "F5_NGROK_AUTH_TOKEN is missing."
+        )
+
+    if not ngrok_domain:
+        raise RuntimeError(
+            "F5_NGROK_STATIC_DOMAIN is missing."
+        )
+
+    from pyngrok import ngrok
+
+    ngrok.set_auth_token(ngrok_auth)
+
+    tunnel = ngrok.connect(
+        addr=PORT,
+        proto="http",
+        domain=ngrok_domain,
+    )
+
+    print(
+        "F5-TTS public workspace:",
+        tunnel.public_url,
+        flush=True,
+    )
+
+    # Official F5-TTS Gradio launcher.
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "f5_tts.infer.infer_gradio",
+            "--port",
+            str(PORT),
+            "--host",
+            "0.0.0.0",
+        ],
+        start_new_session=True,
+    )
 
     try:
-        response = requests.post(
-            KAGGLE_TTS_ENDPOINT,
-            json=payload,
-            timeout=300,
+        process.wait()
+    finally:
+        try:
+            ngrok.disconnect(tunnel.public_url)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+        launcher_path.write_text(
+            launcher_code,
+            encoding="utf-8",
         )
 
-        if response.status_code != 200:
-            return None, (
-                f"Kaggle generation failed: HTTP "
-                f"{response.status_code}"
-            )
+        # 2. Notebook dictionary for active_worker.ipynb.
+        notebook_source = f"""import os
+import subprocess
+import sys
+import time
 
-        content_type = response.headers.get("content-type", "")
+os.environ["F5_NGROK_AUTH_TOKEN"] = {n_auth!r}
+os.environ["F5_NGROK_STATIC_DOMAIN"] = {n_domain!r}
 
-        if "audio" in content_type:
-            return response.content, None
+# Kill anything already using the F5-TTS port.
+subprocess.run(
+    ["bash", "-lc", "fuser -k 7860/tcp || true"],
+    check=False,
+)
 
-        try:
-            data = response.json()
-            return data, None
-        except Exception:
-            return response.content, None
+# Install pyngrok and F5-TTS into the Kaggle GPU runtime.
+subprocess.check_call(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "--upgrade",
+        "pip",
+    ]
+)
+
+subprocess.check_call(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "pyngrok",
+        "f5-tts",
+    ]
+)
+
+launcher = "/kaggle/working/master_wrapper_launcher.py"
+
+# Start the wrapper in the background.
+process = subprocess.Popen(
+    [
+        sys.executable,
+        launcher,
+    ],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.STDOUT,
+    start_new_session=True,
+)
+
+print("F5-TTS worker started with PID:", process.pid)
+time.sleep(8)
+print("Secure workspace: https://{n_domain}")
+"""
+
+        notebook = {
+            "cells": [
+                {
+                    "cell_type": "code",
+                    "execution_count": None,
+                    "metadata": {},
+                    "outputs": [],
+                    "source": notebook_source.splitlines(True),
+                }
+            ],
+            "metadata": {
+                "kernelspec": {
+                    "display_name": "Python 3",
+                    "language": "python",
+                    "name": "python3",
+                },
+                "language_info": {
+                    "name": "python",
+                },
+            },
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        }
+
+        notebook_path.write_text(
+            json.dumps(
+                notebook,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        # 3. Generate kernel-metadata.json.
+        metadata = {
+            "id": f"{k_user}/{kernel_slug}",
+            "title": kernel_slug,
+            "code_file": "active_worker.ipynb",
+            "language": "python",
+            "kernel_type": "notebook",
+            "is_private": True,
+            "enable_gpu": True,
+            "enable_internet": True,
+            "machine_shape": "NvidiaTeslaT4",
+            "dataset_sources": [],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": [],
+        }
+
+        metadata_path.write_text(
+            json.dumps(
+                metadata,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        # 4. Set runtime Kaggle environment blocks.
+        env = os.environ.copy()
+        env["KAGGLE_USERNAME"] = k_user
+        env["KAGGLE_API_TOKEN"] = k_token
+        # Compatibility with legacy Kaggle API authentication.
+        env["KAGGLE_KEY"] = k_token
+
+        # 5. Push the notebook to Kaggle and let Kaggle run it.
+        completed = subprocess.run(
+            [
+                "kaggle",
+                "kernels",
+                "push",
+                "-p",
+                str(workspace),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+
+        combined_output = (
+            (completed.stdout or "").strip()
+            + "\n"
+            + (completed.stderr or "").strip()
+        ).strip()
+
+        # 6. Success returns the secure Ngrok workspace URL.
+        if completed.returncode == 0:
+            return f"https://{n_domain}", None
+
+        # Error returns the CLI trace so the caller can avoid charging.
+        return None, (
+            "Kaggle kernel push failed "
+            f"(exit code {completed.returncode}).\n"
+            f"{combined_output}"
+        )
+
+    except FileNotFoundError:
+        return None, (
+            "Kaggle CLI was not found on the Streamlit server. "
+            "Install it with: pip install kaggle"
+        )
+
+    except subprocess.TimeoutExpired as exc:
+        details = ""
+        if exc.stdout:
+            details += str(exc.stdout)
+        if exc.stderr:
+            details += "\n" + str(exc.stderr)
+
+        return None, (
+            "Kaggle kernel push timed out after 600 seconds.\n"
+            f"{details}".strip()
+        )
 
     except Exception as exc:
-        return None, f"Kaggle connection error: {exc}"
+        return None, f"Kaggle infrastructure error: {exc}"
 
 
 # -------------------- SIDEBAR --------------------
@@ -663,8 +937,6 @@ elif page == "🔊 Text To Speech":
                     st.error(error)
 
                 else:
-                    # Deduct only after the external generation request
-                    # succeeds. This prevents charging failed requests.
                     if deduct_characters(current_count):
                         if isinstance(generated, bytes):
                             st.audio(
@@ -689,7 +961,10 @@ elif page == "🔊 Text To Speech":
                             )
                         else:
                             st.success(
-                                "Generation completed."
+                                f"Kaggle workspace ready: {generated}"
+                            )
+                            st.success(
+                                f"{current_count:,} characters deducted."
                             )
 
                         st.rerun()
@@ -721,12 +996,10 @@ elif page in ("⚙️ Settings", "Settings"):
             "System-level GITHUB_PAT_TOKEN remains in Streamlit Secrets."
         )
     else:
-        st.subheader("Kaggle Connection")
+        st.subheader("Kaggle + Ngrok Connection")
 
         st.info(
-            "Enter your Kaggle username and API token. "
-            "The actual GPU execution still requires a Kaggle "
-            "Notebook/API endpoint configured by the administrator."
+            "Enter the four connection fields used by the GPU worker."
         )
 
         saved_username = account_profile.get(
@@ -736,6 +1009,16 @@ elif page in ("⚙️ Settings", "Settings"):
 
         saved_token = account_profile.get(
             "kaggle_token",
+            "",
+        )
+
+        saved_ngrok_auth = account_profile.get(
+            "ngrok_auth_token",
+            "",
+        )
+
+        saved_ngrok_domain = account_profile.get(
+            "ngrok_static_domain",
             "",
         )
 
@@ -751,8 +1034,20 @@ elif page in ("⚙️ Settings", "Settings"):
                 type="password",
             )
 
+            ngrok_auth_token = st.text_input(
+                "Ngrok Auth Token",
+                value=saved_ngrok_auth,
+                type="password",
+            )
+
+            ngrok_static_domain = st.text_input(
+                "Ngrok Static Domain",
+                value=saved_ngrok_domain,
+                placeholder="your-domain.ngrok.app",
+            )
+
             save_kaggle = st.form_submit_button(
-                "💾 Save Kaggle Settings",
+                "💾 Save Connection Settings",
                 use_container_width=True,
             )
 
@@ -760,17 +1055,22 @@ elif page in ("⚙️ Settings", "Settings"):
                 if (
                     not kaggle_username.strip()
                     or not kaggle_token.strip()
+                    or not ngrok_auth_token.strip()
+                    or not ngrok_static_domain.strip()
                 ):
                     st.error(
-                        "Enter both Kaggle username and API token."
+                        "Enter Kaggle Username, Kaggle API Token, "
+                        "Ngrok Auth Token and Ngrok Static Domain."
                     )
 
                 elif save_kaggle_settings(
                     kaggle_username,
                     kaggle_token,
+                    ngrok_auth_token,
+                    ngrok_static_domain,
                 ):
                     st.success(
-                        "Kaggle settings saved."
+                        "Kaggle + Ngrok settings saved."
                     )
                     st.rerun()
 
@@ -943,6 +1243,8 @@ elif page == "Deploy New SaaS Client":
                     "is_admin": False,
                     "kaggle_username": "",
                     "kaggle_token": "",
+                    "ngrok_auth_token": "",
+                    "ngrok_static_domain": "",
                 }
 
                 if push_database_updates_to_github(
