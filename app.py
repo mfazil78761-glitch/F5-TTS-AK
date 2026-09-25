@@ -55,9 +55,10 @@ def push_database_updates_to_github(updated_db_dict):
         f"{REPO_NAME}/contents/users_db.json"
     )
 
-    headers = {
-        "Authorization": f"token {GITHUB_PAT_TOKEN}",
+        headers = {
+        "Authorization": f"Bearer {GITHUB_PAT_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
     }
 
     try:
