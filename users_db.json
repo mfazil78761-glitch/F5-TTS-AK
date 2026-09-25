@@ -15,6 +15,14 @@
       "remaining_chars": 10000,
       "is_revoked": false,
       "is_admin": false
+    },
+    "RAZA": {
+      "password": "Raza123",
+      "expiry_timestamp": "2026-10-25 12:39:00",
+      "total_limit": 1000000,
+      "remaining_chars": 1000000,
+      "is_revoked": false,
+      "is_admin": false
     }
   }
 }
