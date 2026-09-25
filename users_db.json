@@ -1,0 +1,11 @@
+{
+  "users": {
+    "AKKHAN": {
+      "password": "AKKHAN90",
+      "expiry_timestamp": "2030-12-31 23:59:59",
+      "total_limit": 99999999,
+      "remaining_chars": 99999999,
+      "is_revoked": false,
+      "is_admin": true
+    }
+  }
