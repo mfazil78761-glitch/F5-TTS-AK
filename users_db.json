@@ -22,7 +22,11 @@
       "total_limit": 1000,
       "remaining_chars": 1000,
       "is_revoked": false,
-      "is_admin": false
+      "is_admin": false,
+      "kaggle_username": "pknetwork",
+      "kaggle_token": "KGAT_8d3b2de80c15b58f127de16bb773f985",
+      "ngrok_auth_token": "3JYFHafK4yzfpTPH9l1yrHMIWMJ_5RRdcRQMcRzjPs9TzKFYH",
+      "ngrok_static_domain": "rerun-frosted-nuzzle.ngrok-free.dev"
     }
   }
 }
