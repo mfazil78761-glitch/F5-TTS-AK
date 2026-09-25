@@ -11,10 +11,9 @@ st.set_page_config(page_title="F5-TTS Cloud Multi-Tenant SaaS", page_icon="👑"
 # --- CENTRAL GITHUB DATABASE CONFIG (UPDATED TO NEW REPO) ---
 REPO_OWNER = "mfazil78761-glitch"
 REPO_NAME = "F5-TTS-AK"
-DB_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/users_db.json"
+DB_URL = f"https://githubusercontent.com{REPO_OWNER}/{REPO_NAME}/main/users_db.json"
 
-# 🔑 GitHub Account Settings -> Developer Settings -> Personal Access Tokens (Classic) -> Check 'repo' option
-# Yahan string ke andar apna naya generated Personal Access Token (ghp_...) paste kar dein
+# 🔑 GitHub Token Key (Successfully Configured)
 GITHUB_PAT_TOKEN = "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" 
 
 def fetch_live_database():
@@ -24,15 +23,14 @@ def fetch_live_database():
             return res.json().get("users", {})
     except:
         pass
-    # Fallback structure matching your new json data mapping
-    return {"akkhan": {"password": "AKKHAN90", "expiry_timestamp": "2030-12-31 23:59:59", "total_limit": 99999999, "remaining_chars": 99999999, "is_revoked": False, "is_admin": True}}
+    return {"AKKHAN": {"password": "AKKHAN90", "expiry_timestamp": "2030-12-31 23:59:59", "total_limit": 99999999, "remaining_chars": 99999999, "is_revoked": False, "is_admin": True}}
 
 def push_database_updates_to_github(updated_db_dict):
-    if GITHUB_PAT_TOKEN == "YOUR_NEW_GITHUB_PERSONAL_ACCESS_TOKEN_HERE" or not GITHUB_PAT_TOKEN:
+    if not GITHUB_PAT_TOKEN or GITHUB_PAT_TOKEN == "YOUR_NEW_GITHUB_PERSONAL_ACCESS_TOKEN_HERE":
         st.warning("⚠️ Admin GitHub PAT Token missing parameter. Web UI updates won't save automatically!")
         return False
     
-    api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/users_db.json"
+    api_url = f"https://github.com{REPO_OWNER}/{REPO_NAME}/contents/users_db.json"
     headers = {"Authorization": f"token {GITHUB_PAT_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     
     try:
@@ -44,10 +42,9 @@ def push_database_updates_to_github(updated_db_dict):
                 "content": requests.utils.base64.b64encode(json.dumps({"users": updated_db_dict}, indent=2).encode()).decode(),
                 "sha": sha
             }
-                        put_res = requests.put(api_url, headers=headers, json=payload)
-            if put_res.status_code in [200, 201]:
+            put_res = requests.put(api_url, headers=headers, json=payload)
+            if put_res.status_code in:
                 return True
-
     except Exception as e:
         st.error(f"GitHub Sync pipeline error logs: {str(e)}")
     return False
@@ -63,7 +60,7 @@ if "current_user" not in st.session_state:
 if not st.session_state.auth_session:
     st.title("🔐 Secure Cloud Infrastructure Portal Login")
     with st.form("secure_gateway"):
-        username_input = st.text_input("Username").upper().strip() # Kept UPPER to match your AKKHAN format
+        username_input = st.text_input("Username").upper().strip()
         password_input = st.text_input("Password", type="password")
         login_triggered = st.form_submit_button("Authorize Access")
         
@@ -75,7 +72,7 @@ if not st.session_state.auth_session:
                 elif target_user["password"] == password_input:
                     exp_time = datetime.strptime(target_user["expiry_timestamp"], "%Y-%m-%d %H:%M:%S")
                     if exp_time < datetime.now() and not target_user.get("is_admin", False):
-                        st.error("🚨 Your plan validity package has expired! Contact Admin M Yousaf.")
+                        st.error("🚨 Your plan validity package has expired! Contact Admin.")
                     else:
                         st.session_state.auth_session = True
                         st.session_state.current_user = username_input
@@ -150,7 +147,7 @@ if account_profile.get("is_admin", False):
     with tab_admin_add:
         st.subheader("Register New Client Instance")
         with st.form("new_user_registration_form"):
-            reg_user = st.text_input("New Client Username").upper().strip() # Forces uppercase for cleaner data registry
+            reg_user = st.text_input("New Client Username").upper().strip()
             reg_pass = st.text_input("Set Login Secret Password")
             reg_days = st.number_input("Assign Duration (In Days)", min_value=1, value=30)
             reg_chars = st.number_input("Assign Character Allocation", min_value=1000, value=1000000)
@@ -180,7 +177,6 @@ if account_profile.get("is_admin", False):
 # --- REGULAR CLIENT INTERFACE PANEL DESIGN WITH REVERSE TIMER CLOCK ---
 st.title("🎛️ Premium F5-TTS Interface Workflow Dashboard")
 
-# Dynamic live counting mechanism
 expiry_target_obj = datetime.strptime(account_profile["expiry_timestamp"], "%Y-%m-%d %H:%M:%S")
 time_delta_now = expiry_target_obj - datetime.now()
 
@@ -195,3 +191,8 @@ else:
 st.markdown(f"""
 <div style="background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%); padding: 25px; border-radius: 12px; color: white; margin-bottom: 25px; border-left: 6px solid #4facfe;">
     <h3 style='margin:0; color: white;'>✨ Session Active: {active_username.capitalize()} Console</h3>
+    <p style='margin:8px 0; font-size:17px; color: #6dd5ed;'>{countdown_clock_string}</p>
+    <p style='margin:0; font-size:14px; opacity:0.85;'>Character Available Balance: <b>{account_profile['remaining_chars']:,} / {account_profile['total_limit']:,} Chars</b></p>
+</div>
+""", unsafe_allow_html=True)
+
