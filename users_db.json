@@ -10,10 +10,10 @@
     },
     "USAMA": {
       "password": "Usama@3298",
-      "expiry_timestamp": "2026-09-29 11:52:05",
+      "expiry_timestamp": "2026-10-29 11:52:05",
       "total_limit": 10000,
-      "remaining_chars": 2314,
-      "is_revoked": true,
+      "remaining_chars": 1000000,
+      "is_revoked": false,
       "is_admin": false,
       "kaggle_username": "pknetwork",
       "kaggle_token": "KGAT_8d3b2de80c15b58f127de16bb773f985"
