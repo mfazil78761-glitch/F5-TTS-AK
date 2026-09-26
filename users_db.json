@@ -15,14 +15,14 @@
       "remaining_chars": 1000000,
       "is_revoked": false,
       "is_admin": false,
-      "kaggle_username": "SalmanAli61",
-      "kaggle_token": "KGAT_0e6377776f4317c1a938d9ff5947a8c4"
+      "kaggle_username": "mfazil761",
+      "kaggle_token": "KGAT_92e513d377956ae5b79234d5470fc971"
     },
     "RAZA": {
       "password": "Raza123",
       "expiry_timestamp": "2026-09-27 12:40:21",
       "total_limit": 1000,
-      "remaining_chars": 77144,
+      "remaining_chars": 97144,
       "is_revoked": false,
       "is_admin": false,
       "kaggle_username": "pknetwork",
