@@ -30,7 +30,7 @@
     },
     "AHMAD": {
       "password": "Ahmad123",
-      "expiry_timestamp": "2026-10-26 05:18:29",
+      "expiry_timestamp": "2026-10-26 05:18:34",
       "total_limit": 1000000,
       "remaining_chars": 1000000,
       "is_revoked": false,
